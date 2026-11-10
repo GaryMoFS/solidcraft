@@ -5737,7 +5737,8 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             if !designation.trim().is_empty() && suggested.as_deref() != Some(designation.as_str()) {
                 p["designation"] = json!(designation.trim());
             }
-            crate::dialogs_thread::put_params(&mut p, length, options, &d.inputs);
+            let modeled = d.extra.get("modeled").and_then(Value::as_bool).unwrap_or(false);
+            crate::dialogs_thread::put_params(&mut p, length, options, &d.inputs, modeled);
             ("solid.thread", p)
         }
         Kind::Material { index, editor } => {

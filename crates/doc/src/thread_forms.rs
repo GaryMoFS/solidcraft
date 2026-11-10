@@ -588,12 +588,16 @@ impl ThreadForm {
         // internal major radius)
         let (fl, flat, depth, r3, r1, r4) = match self {
             ThreadForm::Metric | ThreadForm::Square => {
-                // ISO 68-1: H = P sqrt3/2, basic depth 5H/8, flats P/8 at the major and P/4 at
-                // the minor diameter.
+                // ISO 68-1/724: H = P sqrt3/2. The internal tooth height is H1 = 5H/8;
+                // the external design root is deeper, h3 = 17H/24. Flats are P/8 at an
+                // external crest and P/4 at an internal crest.
                 let h = p * 3f64.sqrt() / 2.0;
-                let r_minor = d / 2.0 - 5.0 * h / 8.0;
+                let internal_depth = 5.0 * h / 8.0;
+                let external_depth = 17.0 * h / 24.0;
+                let r_external_minor = d / 2.0 - external_depth;
+                let r_internal_minor = d / 2.0 - internal_depth;
                 let flat = if internal { p / 4.0 } else { p / 8.0 };
-                (half(30.0), flat, 5.0 * h / 8.0, r_minor, r_minor, d / 2.0)
+                (half(30.0), flat, if internal { internal_depth } else { external_depth }, r_external_minor, r_internal_minor, d / 2.0)
             }
             ThreadForm::Trapezoidal => {
                 // ISO 2904: 30°, H1 = P/2, flats P/2 - P/2 tan 15° (0.366 P) at both crests,
@@ -763,7 +767,8 @@ mod tests {
         for (d, p, d3, d1) in [(10.0, 2.0, 6.529, 7.0), (40.0, 7.0, 27.851, 29.5)] {
             assert!((ext(s, d, p) - d3).abs() < 5e-4 && (int(s, d, p).0 - d1).abs() < 1e-9, "S{d}x{p}");
         }
-        assert!((ext(ThreadForm::Metric, 10.0, 1.5) - 8.376).abs() < 5e-4);
+        assert!((ext(ThreadForm::Metric, 10.0, 1.5) - 8.160).abs() < 5e-4);
+        assert!((int(ThreadForm::Metric, 10.0, 1.5).0 - 8.376).abs() < 5e-4);
         // DIN 513 flat w = 0.26384 P.
         assert!((s.groove(10.0, 2.0, false).crest_flat - 0.26384 * 2.0).abs() < 1e-5);
         // ASME B1.9 flat 0.16316 P, B1.5 flat 0.3707 P.

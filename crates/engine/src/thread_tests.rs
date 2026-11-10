@@ -1032,13 +1032,12 @@ fn a_chamfered_tip_tapers_the_last_teeth() {
     let want = PI * 64.0 * 10.0 + m10_stock(10.0, 35.0, |z| 5f64.min(rf + (35.0 - z) * slope));
     let got = exact_volume(&s, "Part");
     assert!((got - want).abs() < want * 1e-4, "{got} vs {want}");
-    // Internal threads take a countersink instead.
+    // An internal thread takes an entry chamfer at each mouth (see
+    // `a_through_holes_thread_chamfered_at_both_ends_has_an_entry_chamfer_at_both_mouths`).
     let mut s = Session::default();
     run(&mut s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 10, "body_name": "Nut"}));
     run(&mut s, "solid.hole", json!({"position": [0, 0, 10], "diameter": 8.5}));
-    let e =
-        s.execute("solid.thread", &json!({"face": [4.25, 0, 5], "designation": "M10", "tip": "both", "modeled": true})).err().map(|e| e.to_string());
-    assert!(e.unwrap_or_default().contains("countersink"));
+    run(&mut s, "solid.thread", json!({"face": [4.25, 0, 5], "designation": "M10", "tip": "both", "modeled": true}));
     // ISO 4753 is for ISO metric threads: another form names its chamfer depth.
     let mut s = Session::default();
     run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 40, "body_name": "Screw"}));
@@ -1527,4 +1526,146 @@ fn a_modelled_thread_leaves_the_next_hole_a_cylinder_to_thread() {
         let t3 = s.execute("solid.thread", &json!({"face": [22.5 + gap, 40.0, 10.0], "designation": "M6", "modeled": true}));
         assert!(t3.is_ok(), "gap {gap}: the second hole takes a modelled thread: {t3:?}");
     }
+}
+
+/// A relief groove's radius on an M10 thread: an external thread's root (after the thread's own
+/// root rule) less the default 0.1 P, or an internal one's root plus it.
+fn relief_radius(internal: bool) -> f64 {
+    let root = solidcraft_doc::thread_forms::ThreadForm::Metric.groove(10.0, 1.5, internal).root_r;
+    if internal { root + 0.15 } else { root - 0.15 }
+}
+
+/// A relief groove at a shoulder: the thread runs out into a plain groove 1.5 P wide against
+/// the collar, every slice of it a whole cylinder at the relief's radius (no partial tooth left),
+/// the collar whole, and the thread above it still cut.
+#[test]
+fn a_relief_groove_at_a_shoulder_leaves_a_plain_neck_and_the_collar_whole() {
+    let mut s = shaft_on_collar();
+    run(&mut s, "solid.thread", json!({"face": [5, 0, 25], "designation": "M10", "modeled": true, "relief": true}));
+    let r = relief_radius(false);
+    let neck = volume_between(&s, "Part", (10.05, 12.2), None);
+    let want = PI * r * r * 2.15;
+    assert!((neck - want).abs() < want * 1e-6, "the neck is {neck}, not a cylinder of {want}");
+    let collar = volume_between(&s, "Part", (-1.0, 10.0), None);
+    assert!((collar - PI * 640.0).abs() < 1e-6 * PI * 640.0, "the collar lost {} mm³", PI * 640.0 - collar);
+    let thread = volume_between(&s, "Part", (15.0, 18.0), None);
+    assert!(thread < PI * 25.0 * 3.0 * 0.95 && thread > PI * r * r * 3.0, "the thread above the neck: {thread}");
+}
+
+/// With a length, the relief lies just past the thread's end: the thread keeps its length, the
+/// neck below it is a plain cylinder, and the shaft below the neck is untouched (the groove's
+/// square stop was cut away with the neck).
+#[test]
+fn a_relief_groove_after_a_length_lies_just_past_the_thread() {
+    let mut s = shaft_on_collar();
+    run(
+        &mut s,
+        "solid.thread",
+        json!({"face": [5, 0, 30], "designation": "M10", "length": 10, "modeled": true, "relief": {"width": "3 mm", "depth": "0.2 mm"}}),
+    );
+    let root = solidcraft_doc::thread_forms::ThreadForm::Metric.groove(10.0, 1.5, false).root_r;
+    let r = root - 0.2;
+    // The thread runs z 25..35, the neck z 22..25.
+    let neck = volume_between(&s, "Part", (22.05, 24.95), None);
+    let want = PI * r * r * 2.9;
+    assert!((neck - want).abs() < want * 1e-6, "the neck is {neck}, not {want}");
+    let plain = volume_between(&s, "Part", (11.0, 21.95), None);
+    assert!((plain - PI * 25.0 * 10.95).abs() < 1e-6 * PI * 25.0 * 10.95, "the shaft below the neck lost {} mm³", PI * 25.0 * 10.95 - plain);
+    let thread = volume_between(&s, "Part", (26.0, 33.5), None);
+    assert!(thread < PI * 25.0 * 7.5 * 0.95, "the thread is cut above the neck: {thread}");
+}
+
+/// A blind tapped hole's relief: a ring cut out past the thread's root at the hole's bottom.
+#[test]
+fn a_relief_groove_at_a_blind_holes_bottom_cuts_out_past_the_root() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 20, "body_name": "Block"}));
+    run(&mut s, "solid.hole", json!({"position": [0, 0, 20], "diameter": 8.5, "depth": 12}));
+    run(&mut s, "solid.thread", json!({"face": [4.25, 0, 14], "designation": "M10", "modeled": true, "relief": true}));
+    let r = relief_radius(true);
+    // The hole's wall runs z 8..20; the relief is its bottom 2.25 mm.
+    let ring = volume_between(&s, "Block", (8.05, 10.2), None);
+    let want = (400.0 - PI * r * r) * 2.15;
+    assert!((ring - want).abs() < want * 1e-6, "the relief slice is {ring}, not {want}");
+}
+
+/// A relief is refused where it can't go, with the reason, and nothing is added.
+#[test]
+fn a_relief_groove_is_refused_where_it_cannot_go() {
+    let refused = |s: &mut Session, p: Value, says: &str| {
+        let before = s.doc.features.len();
+        let e = s.execute("solid.thread", &p).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains(says), "{p}: {e}");
+        assert_eq!(s.doc.features.len(), before, "{p}: a refused thread adds nothing");
+    };
+    let mut s = shaft_on_collar();
+    refused(&mut s, json!({"face": [5, 0, 25], "designation": "M10", "relief": true}), "modelled");
+    refused(&mut s, json!({"face": [5, 0, 25], "designation": "M10", "modeled": true, "relief": true, "ease_out": "standard"}), "not both");
+    refused(&mut s, json!({"face": [5, 0, 25], "designation": "M10", "modeled": true, "relief": {"width": "1 mm"}}), "at least one pitch");
+    refused(&mut s, json!({"face": [5, 0, 25], "designation": "M10", "modeled": true, "relief": {"width": "30 mm"}}), "no length");
+    refused(&mut s, json!({"face": [5, 0, 25], "designation": "M10", "modeled": true, "relief": "yes"}), "`relief` must be");
+    // A plain shaft threaded from its top: the inner end, its bottom, is free too.
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 5, "height": 30, "body_name": "Part"}));
+    refused(&mut s, json!({"face": [5, 0, 15], "designation": "M10", "from": [0, 0, 30], "modeled": true, "relief": true}), "free end");
+}
+
+/// The volume of a 20 x 20 block's slice from `y0` to `y1` below a hole's mouth, where a 45°
+/// entry chamfer reaching radius `r_f` at the mouth takes everything inside its cone (past the
+/// thread's major radius there, so no tooth is left in the slice).
+fn chamfered_slice(r_f: f64, (y0, y1): (f64, f64)) -> f64 {
+    let cube = |y: f64| (r_f - y).powi(3) / 3.0;
+    400.0 * (y1 - y0) - PI * (cube(y0) - cube(y1))
+}
+
+/// An internal thread's chamfered start is an entry chamfer at the hole's mouth (the thread's
+/// lead-in, 90° included), out to 0.1 P past the major diameter: a blind hole threaded over its
+/// whole wall, with no start end picked, is chamfered at its mouth (its only free end), and its
+/// bottom is left alone.
+#[test]
+fn a_tapped_holes_chamfered_start_is_an_entry_chamfer_at_its_mouth() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 20, "body_name": "Block"}));
+    run(&mut s, "solid.hole", json!({"position": [0, 0, 20], "diameter": 8.5, "depth": 12}));
+    run(&mut s, "solid.thread", json!({"face": [4.25, 0, 14], "designation": "M10", "modeled": true, "tip": "start"}));
+    let got = volume_between(&s, "Block", (19.9, 21.0), None);
+    let want = chamfered_slice(5.15, (0.0, 0.1));
+    assert!((got - want).abs() < want * 1e-6, "the slice at the mouth is {got}, not {want}");
+    // A depth given is radial from the minor diameter (the crest of the hole's teeth).
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 20, "body_name": "Block"}));
+    run(&mut s, "solid.hole", json!({"position": [0, 0, 20], "diameter": 8.5, "depth": 12}));
+    run(&mut s, "solid.thread", json!({"face": [4.25, 0, 14], "designation": "M10", "modeled": true, "tip": "start", "chamfer_depth": "1 mm"}));
+    let crest = solidcraft_doc::thread_forms::ThreadForm::Metric.groove(10.0, 1.5, true).crest_r;
+    let got = volume_between(&s, "Block", (19.9, 21.0), None);
+    let want = chamfered_slice(crest + 1.0, (0.0, 0.1));
+    assert!((got - want).abs() < want * 1e-6, "with a 1 mm depth the slice is {got}, not {want}");
+}
+
+/// `tip: both` on a through hole chamfers the entry at both of its mouths.
+#[test]
+fn a_through_holes_thread_chamfered_at_both_ends_has_an_entry_chamfer_at_both_mouths() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 20, "body_name": "Block"}));
+    run(&mut s, "solid.hole", json!({"position": [0, 0, 20], "diameter": 8.5}));
+    run(&mut s, "solid.thread", json!({"face": [4.25, 0, 10], "designation": "M10", "modeled": true, "tip": "both", "from": [4.25, 0, 20]}));
+    let want = chamfered_slice(5.15, (0.0, 0.1));
+    for (z0, z1) in [(19.9, 21.0), (-1.0, 0.1)] {
+        let got = volume_between(&s, "Block", (z0, z1), None);
+        assert!((got - want).abs() < want * 1e-6, "the slice {z0}..{z1} is {got}, not {want}");
+    }
+}
+
+/// A shaft threaded over its whole face up to a collar, chamfered at its start with no start end
+/// picked: the chamfer goes on the free end, not the collar's.
+#[test]
+fn a_whole_face_threads_chamfered_start_goes_on_its_free_end() {
+    let mut s = shaft_on_collar();
+    run(&mut s, "solid.thread", json!({"face": [5, 0, 25], "designation": "M10", "modeled": true, "tip": "start"}));
+    let collar = volume_between(&s, "Part", (-1.0, 10.0), None);
+    assert!((collar - PI * 640.0).abs() < 1e-6 * PI * 640.0, "the collar lost {} mm³", PI * 640.0 - collar);
+    // The top 0.1 mm is inside the chamfer's cone, d_f = d3 at the end.
+    let d3 = 10.0 - 2.0 * 17.0 / 24.0 * 1.5 * 3f64.sqrt() / 2.0;
+    let top = volume_between(&s, "Part", (34.9, 36.0), None);
+    assert!(top < PI * (d3 / 2.0 + 0.1).powi(2) * 0.1 * 1.0001, "the free end is chamfered: {top}");
 }

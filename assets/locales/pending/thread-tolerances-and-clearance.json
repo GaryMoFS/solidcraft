@@ -1,0 +1,22 @@
+{
+  "en": {
+    "thread.clearance_help": "Start with the nominal blank (M30 = Ø30 mm). This extra diametral clearance is cut by the modeled Thread feature: 0.2 mm makes the male crest diameter Ø29.8 mm, or opens the female bore by 0.2 mm. Normally set it on one mating part.",
+    "thread.tolerance_class_help": "ISO 965 class callout. The class is saved for fit specification; use Modeling clearance to adjust the modeled solid for a process such as 3D printing."
+  },
+  "ja": {
+    "thread.clearance_help": "部品ごとの直径方向の値です。0.2 mmなら、外ねじを0.2 mm細くするか、内ねじ穴を0.2 mm広げます。すきまを2倍にしたい場合を除き、組み合わせる部品の片側だけに設定してください。",
+    "thread.tolerance_class_help": "ISO 965の公差クラス指定です。クラスは適合指定として保存されます。3Dプリントなどの製造方法に合わせて形状を調整するには、モデリングすきまを使用してください。"
+  },
+  "zh": {
+    "thread.clearance_help": "从公称毛坯开始（M30 = Ø30 mm）。该直径间隙由建模螺纹特征切除：0.2 mm 会使外螺纹牙顶直径为 Ø29.8 mm，或使内螺纹孔增大 0.2 mm。通常只在配合零件的一侧设置。",
+    "thread.tolerance_class_help": "ISO 965 公差等级标注。该等级作为配合规范保存；如需针对 3D 打印等工艺调整模型实体，请使用建模间隙。"
+  },
+  "de": {
+    "thread.clearance_help": "Mit dem Nennrohling beginnen (M30 = Ø30 mm). Dieses zusätzliche Durchmesserspiel wird durch das modellierte Gewinde abgetragen: 0,2 mm ergeben am Außengewinde Ø29,8 mm oder vergrößern die Innenbohrung um 0,2 mm. Normalerweise nur an einem der beiden Gegenstücke einstellen.",
+    "thread.tolerance_class_help": "Toleranzklassenangabe nach ISO 965. Die Klasse wird als Passungsangabe gespeichert. Für eine Prozessanpassung, etwa beim 3D-Druck, die Modellierungszugabe verwenden."
+  },
+  "ko": {
+    "thread.clearance_help": "공칭 원통으로 시작하세요(M30 = Ø30 mm). 이 추가 지름 간극은 모델링된 나사산 피처가 절삭합니다. 0.2 mm는 외부 나사산 꼭대기 지름을 Ø29.8 mm로 만들거나 내부 구멍을 0.2 mm 넓힙니다. 일반적으로 맞물리는 부품 중 한쪽에만 설정하세요.",
+    "thread.tolerance_class_help": "ISO 965 공차 등급 표기입니다. 등급은 끼워맞춤 지정으로 저장됩니다. 3D 프린팅 같은 공정에 맞춰 모델 형상을 조정하려면 모델링 간극을 사용하세요."
+  }
+}

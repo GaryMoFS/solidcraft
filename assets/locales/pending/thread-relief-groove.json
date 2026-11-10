@@ -1,0 +1,27 @@
+{
+  "en": {
+    "thread.end_relief": "Relief groove",
+    "thread.relief_depth_help": "Radial depth past the thread's root. Empty: 0.1 × pitch.",
+    "thread.relief_width_help": "Width along the axis, at least one pitch. Empty: 1.5 × pitch. Against a shoulder or a blind hole's bottom it ends there; with a length, it starts where the thread ends."
+  },
+  "de": {
+    "thread.end_relief": "Freistich",
+    "thread.relief_depth_help": "Radiale Tiefe über den Gewindegrund hinaus. Leer: 0,1 × Steigung.",
+    "thread.relief_width_help": "Breite entlang der Achse, mindestens eine Steigung. Leer: 1,5 × Steigung. An einer Schulter oder am Grund einer Sacklochbohrung endet er dort; mit einer Länge beginnt er am Gewindeende."
+  },
+  "ja": {
+    "thread.end_relief": "ねじ逃げ溝",
+    "thread.relief_depth_help": "ねじ谷底からの半径方向の深さ。空欄: 0.1 × ピッチ。",
+    "thread.relief_width_help": "軸方向の幅（1ピッチ以上）。空欄: 1.5 × ピッチ。段や止まり穴の底がある場合はそこで終わり、長さを指定した場合はねじの終わりから始まります。"
+  },
+  "ko": {
+    "thread.end_relief": "나사 릴리프 홈",
+    "thread.relief_depth_help": "나사 골지름에서 반지름 방향 깊이. 비우면 0.1 × 피치.",
+    "thread.relief_width_help": "축 방향 폭, 최소 1피치. 비우면 1.5 × 피치. 단차나 막힌 구멍 바닥에서는 그곳에서 끝나고, 길이를 지정하면 나사가 끝나는 곳에서 시작합니다."
+  },
+  "zh": {
+    "thread.end_relief": "螺纹退刀槽",
+    "thread.relief_depth_help": "从螺纹牙底起的径向深度。留空：0.1 × 螺距。",
+    "thread.relief_width_help": "沿轴向的宽度，至少一个螺距。留空：1.5 × 螺距。靠在轴肩或盲孔底部时止于该处；指定长度时从螺纹结束处开始。"
+  }
+}

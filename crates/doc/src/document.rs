@@ -990,6 +990,21 @@ pub enum FeatureKind {
         /// Buttress forms: which way the steep flank of the screw's teeth faces.
         #[serde(default, skip_serializing_if = "crate::thread_forms::is_default")]
         steep_flank: crate::thread_forms::SteepFlank,
+        /// ISO 965 tolerance class callout (for example 6H or 6g). This is not a fit change
+        /// when absent; the modeled clearance below is the explicit geometry adjustment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tolerance_class: Option<String>,
+        /// Diametral manufacturing allowance applied to modeled geometry; positive opens an
+        /// internal thread or turns down an external thread by this diameter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(length = "Modeling clearance")]
+        clearance: Option<Expr>,
+        /// A relief groove (thread undercut) at the thread's inner end, the one away from where
+        /// it starts: a plain groove past the thread's root that the thread runs out into, at a
+        /// shoulder, a blind hole's bottom or where a thread of some length stops. Modelled
+        /// threads only, in place of a runout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relief: Option<ThreadRelief>,
         /// Set on threads saved before holes were sized by their nominal diameter, whose size
         /// was left to the tap drill: a 12 mm hole stays M14 there. New threads leave it off.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2063,6 +2078,18 @@ pub enum ThreadLimit {
     Face(FacePick),
     /// Where this plane crosses the thread's axis.
     Plane(PlaneRef),
+}
+
+/// A thread's relief groove: its width along the axis (default 1.5 pitches, at least one) and
+/// its radial depth past the thread's root (default 0.1 pitch).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
+pub struct ThreadRelief {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[walk(length = "Relief width")]
+    pub width: Option<Expr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[walk(length = "Relief depth")]
+    pub depth: Option<Expr>,
 }
 
 /// A thread's runout length at one end: a length, or ISO 3508's standard (2.5 P) or short

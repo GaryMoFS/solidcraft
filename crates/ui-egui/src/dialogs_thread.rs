@@ -221,7 +221,35 @@ const STARTS_AT: &[&str] = &["None", "Chamfer"];
 /// The thread's inner end: a square stop (the groove ends in its own profile) or a fade
 /// (ISO 3508's runout).
 const ENDS_AT: &[&str] = &["thread.end_square", "ui.fade"];
+/// A Thread feature's inner end, which can also end in a relief groove (a tapped hole's can't).
+const THREAD_ENDS_AT: &[&str] = &["thread.end_square", "ui.fade", "thread.end_relief"];
 const FLANKS: &[(&str, SteepFlank)] = &[("End", SteepFlank::End), ("Start", SteepFlank::Start)];
+const TOLERANCE_CLASSES: &[&str] = &[
+    "Basic profile",
+    "6H/6g (general purpose)",
+    "4H",
+    "5H",
+    "6H",
+    "7H",
+    "8H",
+    "4G",
+    "5G",
+    "6G",
+    "7G",
+    "8G",
+    "4h",
+    "6h",
+    "8h",
+    "4g",
+    "6g",
+    "8g",
+    "4f",
+    "6f",
+    "8f",
+    "4e",
+    "6e",
+    "8e",
+];
 
 /// The pick of the end the thread is measured from (`from`).
 const START_END: &str = "Start end (optional)";
@@ -281,6 +309,14 @@ pub struct Options {
     pub chamfer_angle: String,
     pub chamfer_depth: String,
     pub steep_flank: SteepFlank,
+    /// ISO 965 metric class callout; empty keeps the basic profile.
+    pub tolerance_class: String,
+    /// Per-feature diametral modeling clearance (positive opens a nut or turns down a bolt).
+    pub clearance: String,
+    /// The inner end is a relief groove, with its typed width and depth (empty: the defaults).
+    pub relief: bool,
+    pub relief_width: String,
+    pub relief_depth: String,
 }
 
 impl Default for Options {
@@ -295,6 +331,11 @@ impl Default for Options {
             chamfer_angle: String::new(),
             chamfer_depth: String::new(),
             steep_flank: SteepFlank::default(),
+            tolerance_class: String::new(),
+            clearance: String::new(),
+            relief: false,
+            relief_width: String::new(),
+            relief_depth: String::new(),
         }
     }
 }
@@ -303,7 +344,7 @@ impl Options {
     /// Does the thread start at one end of the face (a length or an Up To extent, a runout or a
     /// tip)? Then the end to start from can be picked.
     pub fn starts_at_an_end(&self) -> bool {
-        self.extent != FULL || self.ease_out.fade || self.tip != ThreadTip::None
+        self.extent != FULL || self.ease_out.fade || self.relief || self.tip != ThreadTip::None
     }
 }
 
@@ -434,6 +475,28 @@ pub(crate) fn rows(
     if !f.sizes().is_empty() {
         size_rows(ui, f, designation, suggested);
     }
+    if f == ThreadForm::Metric {
+        form_row(ui, "ISO 965 tolerance class", |ui| {
+            let mut selected = match o.tolerance_class.as_str() {
+                "" => 0,
+                "6H/6g" => 1,
+                class => TOLERANCE_CLASSES.iter().position(|item| *item == class).unwrap_or(0),
+            };
+            let before = selected;
+            combo(ui, "thread_tolerance_class", TOLERANCE_CLASSES, &mut selected);
+            ui.label("ⓘ").on_hover_text(crate::i18n::tr("thread.tolerance_class_help"));
+            if selected != before {
+                o.tolerance_class = match TOLERANCE_CLASSES.get(selected).copied().unwrap_or("Basic profile") {
+                    "Basic profile" => String::new(),
+                    "6H/6g (general purpose)" => "6H/6g".into(),
+                    other => other.into(),
+                };
+            }
+        });
+    }
+    if *modeled {
+        enter |= hint_row(ui, "Extra clearance (diametral)", &mut o.clearance, tr("thread.clearance_help"));
+    }
     let hint = crate::i18n::format("thread.fits_the_face", &[("example", &example(f))]);
     let (submitted, changed) = text_row(ui, "Designation", designation, &hint);
     enter |= submitted;
@@ -485,9 +548,29 @@ pub(crate) fn rows(
             let depth = if f == ThreadForm::Metric { "ui.iso_4753" } else { "thread.chamfer_depth_needed" };
             enter |= hint_row(ui, "Chamfer Depth", &mut o.chamfer_depth, tr(depth));
         }
-        enter |= end_rows(ui, &mut o.ease_out);
+        enter |= thread_end_rows(ui, o);
     });
     (enter, reset)
+}
+
+/// The inner end of a Thread feature: square, a fade over its length, or a relief groove.
+fn thread_end_rows(ui: &mut egui::Ui, o: &mut Options) -> bool {
+    let mut end = if o.relief { 2 } else { usize::from(o.ease_out.fade) };
+    choice_row(ui, "End", "thread_end", &mut end, THREAD_ENDS_AT);
+    o.ease_out.fade = end == 1;
+    o.relief = end == 2;
+    match end {
+        1 => {
+            let hint = if o.ease_out.short { tr("thread.fade_short") } else { tr("thread.fade_standard") };
+            hint_row(ui, "Fade Length", &mut o.ease_out.length, hint)
+        }
+        2 => {
+            let width = hint_row(ui, "Relief Width", &mut o.relief_width, tr("thread.relief_width_help"));
+            let depth = hint_row(ui, "Relief Depth", &mut o.relief_depth, tr("thread.relief_depth_help"));
+            width | depth
+        }
+        _ => false,
+    }
 }
 
 /// The inner end of a modelled thread (a thread's, or a tapped hole's towards its bottom):
@@ -582,7 +665,7 @@ pub(crate) fn sync_inputs(inputs: &mut Vec<SelInput>, active: &mut usize, o: &Op
 
 /// Put the options into the command's parameters. Defaults are left out, so a thread without
 /// them means what it always did.
-pub(crate) fn put_params(p: &mut Value, length: &str, o: &Options, inputs: &[SelInput]) {
+pub(crate) fn put_params(p: &mut Value, length: &str, o: &Options, inputs: &[SelInput], modeled: bool) {
     if o.form != ThreadForm::Metric {
         p["form"] = json!(o.form.name());
     }
@@ -611,12 +694,23 @@ pub(crate) fn put_params(p: &mut Value, length: &str, o: &Options, inputs: &[Sel
     if let Some(e) = o.ease_out.param() {
         p["ease_out"] = e;
     }
+    if o.relief && modeled {
+        let mut r = json!({});
+        put(&mut r, &[("width", o.relief_width.as_str()), ("depth", o.relief_depth.as_str())]);
+        p["relief"] = if r.as_object().is_some_and(|m| m.is_empty()) { json!(true) } else { r };
+    }
     if o.tip != ThreadTip::None {
         p["tip"] = json!(o.tip);
         put(p, &[("chamfer_angle", o.chamfer_angle.as_str()), ("chamfer_depth", o.chamfer_depth.as_str())]);
     }
     if is_buttress(o.form) && o.steep_flank != SteepFlank::default() {
         p["steep_flank"] = json!(o.steep_flank);
+    }
+    if o.form == ThreadForm::Metric && !o.tolerance_class.is_empty() {
+        p["tolerance_class"] = json!(o.tolerance_class);
+    }
+    if modeled {
+        put(p, &[("clearance", o.clearance.as_str())]);
     }
 }
 
@@ -653,6 +747,9 @@ pub(crate) fn reopen(d: &mut Dialog, s: &Session, kind: &FeatureKind) {
         chamfer_angle,
         chamfer_depth,
         steep_flank,
+        tolerance_class,
+        clearance,
+        relief,
         // Kept by the edit itself (`timeline.redefine`), not a dialog option.
         old_auto_size: _,
     } = kind
@@ -678,6 +775,11 @@ pub(crate) fn reopen(d: &mut Dialog, s: &Session, kind: &FeatureKind) {
         chamfer_angle: chamfer_angle.as_ref().map(expr).unwrap_or_default(),
         chamfer_depth: chamfer_depth.as_ref().map(expr).unwrap_or_default(),
         steep_flank: *steep_flank,
+        tolerance_class: tolerance_class.clone().unwrap_or_default(),
+        clearance: clearance.as_ref().map(expr).unwrap_or_default(),
+        relief: relief.is_some(),
+        relief_width: relief.as_ref().and_then(|r| r.width.as_ref()).map(expr).unwrap_or_default(),
+        relief_depth: relief.as_ref().and_then(|r| r.depth.as_ref()).map(expr).unwrap_or_default(),
     };
     if let Some(inp) = d.inputs.first_mut() {
         inp.items = face_sel(s, face.0).into_iter().collect();
