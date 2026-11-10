@@ -582,18 +582,26 @@ impl ThreadForm {
     /// `flank_lo`/`flank_hi` are for a buttress with its steep flank towards the end (+z); the
     /// caller swaps them for [`SteepFlank::Start`].
     pub fn groove(self, d: f64, p: f64, internal: bool) -> GrooveProfile {
+        self.groove_with(d, p, internal, false)
+    }
+
+    /// [`ThreadForm::groove`], with an external ISO metric thread's root at ISO 724's design
+    /// root h3 = 17H/24 when `design_root` is set (a thread given a tolerance class or a
+    /// clearance, made to fit), instead of the basic profile's 5H/8. Other forms and internal
+    /// threads are the same either way.
+    pub fn groove_with(self, d: f64, p: f64, internal: bool, design_root: bool) -> GrooveProfile {
         let deg = |a: f64| a.to_radians();
         let half = |a: f64| (deg(a), deg(a));
         // (flanks, tooth crest flat, basic depth, external minor radius, internal minor radius,
         // internal major radius)
         let (fl, flat, depth, r3, r1, r4) = match self {
             ThreadForm::Metric | ThreadForm::Square => {
-                // ISO 68-1/724: H = P sqrt3/2. The internal tooth height is H1 = 5H/8;
-                // the external design root is deeper, h3 = 17H/24. Flats are P/8 at an
-                // external crest and P/4 at an internal crest.
+                // ISO 68-1: H = P sqrt3/2, basic depth 5H/8, flats P/8 at the major and P/4 at
+                // the minor diameter. ISO 724's external design root is deeper, h3 = 17H/24,
+                // when `design_root` asks for it.
                 let h = p * 3f64.sqrt() / 2.0;
                 let internal_depth = 5.0 * h / 8.0;
-                let external_depth = 17.0 * h / 24.0;
+                let external_depth = if design_root { 17.0 * h / 24.0 } else { internal_depth };
                 let r_external_minor = d / 2.0 - external_depth;
                 let r_internal_minor = d / 2.0 - internal_depth;
                 let flat = if internal { p / 4.0 } else { p / 8.0 };
@@ -767,7 +775,10 @@ mod tests {
         for (d, p, d3, d1) in [(10.0, 2.0, 6.529, 7.0), (40.0, 7.0, 27.851, 29.5)] {
             assert!((ext(s, d, p) - d3).abs() < 5e-4 && (int(s, d, p).0 - d1).abs() < 1e-9, "S{d}x{p}");
         }
-        assert!((ext(ThreadForm::Metric, 10.0, 1.5) - 8.160).abs() < 5e-4);
+        assert!((ext(ThreadForm::Metric, 10.0, 1.5) - 8.376).abs() < 5e-4);
+        // ISO 724's design root, for a thread made to a fit: d3 = d - 1.226869 P.
+        assert!((2.0 * ThreadForm::Metric.groove_with(10.0, 1.5, false, true).root_r - 8.160).abs() < 5e-4);
+        assert_eq!(ThreadForm::Metric.groove_with(10.0, 1.5, true, true), ThreadForm::Metric.groove(10.0, 1.5, true));
         assert!((int(ThreadForm::Metric, 10.0, 1.5).0 - 8.376).abs() < 5e-4);
         // DIN 513 flat w = 0.26384 P.
         assert!((s.groove(10.0, 2.0, false).crest_flat - 0.26384 * 2.0).abs() < 1e-5);

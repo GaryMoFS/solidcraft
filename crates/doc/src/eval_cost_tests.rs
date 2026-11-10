@@ -1199,6 +1199,7 @@ fn placed_parts(comps: usize, bodies: usize, sketches: usize, taps: usize, copie
                 form: Default::default(),
                 hand: Default::default(),
                 starts: 1,
+                design_root: false,
             });
         }
     }

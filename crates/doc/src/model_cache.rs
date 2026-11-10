@@ -50,6 +50,7 @@ fn same_marking(a: &ThreadInfo, b: &ThreadInfo) -> bool {
             form: _,
             hand: _,
             starts: _,
+            design_root: _,
         } = t;
         [*major_diameter, *radius, *pitch, axis_point.x, axis_point.y, axis_point.z, axis.x, axis.y, axis.z, *start, *end]
     };
@@ -58,6 +59,7 @@ fn same_marking(a: &ThreadInfo, b: &ThreadInfo) -> bool {
         && a.designation == b.designation
         && a.internal == b.internal
         && a.form == b.form
+        && a.design_root == b.design_root
         && a.hand == b.hand
         && a.starts == b.starts
         && numbers(a).iter().zip(numbers(b).iter()).all(|(x, y)| x.to_bits() == y.to_bits())

@@ -1669,3 +1669,40 @@ fn a_whole_face_threads_chamfered_start_goes_on_its_free_end() {
     let top = volume_between(&s, "Part", (34.9, 36.0), None);
     assert!(top < PI * (d3 / 2.0 + 0.1).powi(2) * 0.1 * 1.0001, "the free end is chamfered: {top}");
 }
+
+/// A modelled bolt thread keeps the basic profile's 5H/8 root unless it is made to a fit: with a
+/// tolerance class or a clearance it is cut to ISO 724's deeper design root, 17H/24, and takes
+/// more from the shaft; a class on an internal thread changes nothing.
+#[test]
+fn a_bolt_thread_made_to_a_fit_is_cut_to_the_design_root() {
+    let removed = |extra: Value| {
+        let mut s = Session::default();
+        run(&mut s, "solid.cylinder", json!({"radius": 5, "height": 20, "body_name": "Shaft"}));
+        let before = exact_volume(&s, "Shaft");
+        let mut p = json!({"face": [5, 0, 10], "designation": "M10", "from": [5, 0, 20], "modeled": true});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        run(&mut s, "solid.thread", p);
+        before - exact_volume(&s, "Shaft")
+    };
+    let basic = removed(json!({}));
+    let fitted = removed(json!({"tolerance_class": "6g"}));
+    assert!(fitted > basic * 1.02, "a 6g thread takes {fitted}, the basic profile {basic}");
+    // The clearance turns the shaft down first; its groove is cut to the design root too.
+    let cleared = removed(json!({"clearance": "0.2 mm"}));
+    assert!(cleared > fitted, "with a clearance {cleared}, 6g alone {fitted}");
+    let nut = |extra: Value| {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 10, "body_name": "Nut"}));
+        run(&mut s, "solid.hole", json!({"position": [0, 0, 10], "diameter": 8.5}));
+        let mut p = json!({"face": [4.25, 0, 5], "designation": "M10", "modeled": true, "from": [4.25, 0, 10]});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        run(&mut s, "solid.thread", p);
+        exact_volume(&s, "Nut")
+    };
+    let (plain, classed) = (nut(json!({})), nut(json!({"tolerance_class": "6H"})));
+    assert!((plain - classed).abs() < 1e-9 * plain, "a 6H nut {classed}, without a class {plain}");
+}
