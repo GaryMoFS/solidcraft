@@ -355,6 +355,45 @@ impl CylinderFace {
     }
 }
 
+/// The flat faces that meet `b`'s wall on the cylinder `c` without lying across its axis, each as
+/// its plane `n·x = d` with `n` out of the material: the sides a hole breaks out of the part
+/// through, where it runs past the part's edge or into a slot or pocket. A hole's mouth, floor or
+/// counterbore step (square to its axis) is not one. Exact: the record's surfaces and edges.
+pub fn sides_beside_cylinder(b: &Body, c: &CylinderFace) -> Vec<(Vec3, f64)> {
+    if b.is_mesh() {
+        return Vec::new();
+    }
+    let rec = b.record();
+    let tol = (c.radius * 1e-6).max(1e-6);
+    let k = *c.axis;
+    let on_wall = |f: usize| match surf_of(rec, f) {
+        Some(Surf::Cylinder { o, a, r, .. }) => {
+            let off = o - c.axis_point;
+            (r - c.radius).abs() <= tol && a.normalized().is_some_and(|a| a.cross(k).len() <= 1e-9) && (off - k * off.dot(k)).len() <= tol
+        }
+        _ => false,
+    };
+    let walls: HashSet<usize> = (0..rec.faces.len()).filter(|&f| on_wall(f)).collect();
+    let mut sides: Vec<(Vec3, f64)> = Vec::new();
+    if walls.is_empty() {
+        return sides;
+    }
+    for faces in edge_faces(rec) {
+        if !faces.iter().any(|f| walls.contains(f)) {
+            continue;
+        }
+        for &f in faces.iter().filter(|f| !walls.contains(f)) {
+            if let Some(Surf::Plane { n, d }) = surf_of(rec, f)
+                && n.dot(k).abs() < 1.0 - 1e-9
+                && !sides.iter().any(|(m, e)| (*m - n).len() < 1e-9 && (e - d).abs() <= tol)
+            {
+                sides.push((n, d));
+            }
+        }
+    }
+    sides
+}
+
 /// Whether any of `b`'s material lies in the ring between radii `r_in` and `r_out` about the
 /// face's axis, over `along` (an interval of the axis coordinate the face's `start` and `end`
 /// are in): the exact intersection of the body with that ring, by an SMLib boolean.

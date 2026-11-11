@@ -875,6 +875,102 @@ fn trim_at_shoulders(mut tool: Body, axis: Vec3, ends: [End; 2], face: (f64, f64
 /// Evaluate a thread feature: a cosmetic thread is listed in the model's threads, a modelled
 /// one cut into its body.
 pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st: &mut ModelState, warning: &mut Option<String>) -> Result<()> {
+    let ready = prepare(doc, vals, f, st)?;
+    finish(st, ready, warning)
+}
+
+/// A thread feature worked out on the state it starts from, before anything is cut: what
+/// [`finish`] marks or cuts. A pattern's copies are all worked out first on the part as drilled,
+/// which is meshed once for all of them, then cut one after another.
+pub(super) enum Ready {
+    /// A cosmetic thread, listed in the model's threads.
+    Marked(ThreadInfo),
+    /// A modelled thread, with its chamfered tip (and its angle and depth when given).
+    Cut { on: Box<ThreadOn>, tip: (ThreadTip, Option<f64>, Option<f64>) },
+}
+
+impl Ready {
+    /// The box (lowest and highest corner) a modelled thread's cuts stay within: its face's
+    /// length along the axis and a little beyond, and its diameter and more around it. `None`
+    /// for a cosmetic thread, which cuts nothing.
+    pub(super) fn reach(&self) -> Option<(Vec3, Vec3)> {
+        let Ready::Cut { on, .. } = self else { return None };
+        on.reach()
+    }
+}
+
+impl ThreadOn {
+    /// [`Ready::reach`] of this thread.
+    pub(super) fn reach(&self) -> Option<(Vec3, Vec3)> {
+        let t = &self.info;
+        let k = *t.axis;
+        let margin = 2.0 * t.pitch + self.clearance + 1.0;
+        let r = t.major_diameter.max(2.0 * self.cyl.radius) + margin;
+        let a = t.axis_point + k * (self.cyl.start.min(t.start) - margin);
+        let b = t.axis_point + k * (self.cyl.end.max(t.end) + margin);
+        // A disc of radius r across the axis reaches r * sqrt(1 - k_i^2) along each axis i.
+        let half = Vec3::new(r * (1.0 - k.x * k.x).max(0.0).sqrt(), r * (1.0 - k.y * k.y).max(0.0).sqrt(), r * (1.0 - k.z * k.z).max(0.0).sqrt());
+        let lo = Vec3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z)) - half;
+        let hi = Vec3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z)) + half;
+        (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
+    }
+}
+
+/// Whether any two of `reaches` (modelled threads' boxes, see [`ThreadOn::reach`]) meet, or one
+/// is unknown: their threads are then worked out one after another, each on the part the last
+/// one left, as a feature at a time would.
+pub(super) fn reaches_meet(reaches: &[Option<(Vec3, Vec3)>]) -> bool {
+    let known: Vec<(Vec3, Vec3)> = reaches.iter().flatten().copied().collect();
+    if known.len() < reaches.iter().filter(|r| r.is_some()).count() {
+        return true;
+    }
+    known.iter().enumerate().any(|(i, (a0, a1))| {
+        known.iter().skip(i + 1).any(|(b0, b1)| a0.x <= b1.x && b0.x <= a1.x && a0.y <= b1.y && b0.y <= a1.y && a0.z <= b1.z && b0.z <= a1.z)
+    })
+}
+
+/// A copy of `st` whose bodies keep the meshes made of them: the walls of many copies found on
+/// one part mesh it once.
+pub(super) fn probe_state(st: &ModelState) -> ModelState {
+    let mut probe = st.clone();
+    for b in &mut probe.bodies {
+        b.body = b.body.keeping_meshes();
+    }
+    probe
+}
+
+/// Marks or cuts what [`prepare`] worked out.
+pub(super) fn finish(st: &mut ModelState, ready: Ready, warning: &mut Option<String>) -> Result<()> {
+    let (on, tip) = match ready {
+        Ready::Marked(info) => {
+            st.threads.push(info);
+            return Ok(());
+        }
+        Ready::Cut { on, tip } => (*on, tip),
+    };
+    if let Some(r) = on.narrow {
+        let note = format!(
+            "narrowed the {} mm hole to {} mm (the {} thread's minor diameter) so the thread has material to cut into",
+            show_mm(2.0 * on.cyl.radius),
+            show_mm(2.0 * r),
+            on.info.designation
+        );
+        *warning = Some(match warning.take() {
+            Some(w) => format!("{w}; {note}"),
+            None => note,
+        });
+    }
+    if let Some(note) = cut(st, on, tip)? {
+        *warning = Some(match warning.take() {
+            Some(w) => format!("{w}; {note}"),
+            None => note,
+        });
+    }
+    Ok(())
+}
+
+/// Works out thread feature `f` on `st`, cutting nothing: see [`Ready`].
+pub(super) fn prepare(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st: &ModelState) -> Result<Ready> {
     let FeatureKind::Thread {
         face,
         designation,
@@ -940,30 +1036,11 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
     let ask = ThreadAsk { ease_out: runout(vals, ease_out)?, design_root, ..ask };
     let on = thread_on(st, f.id, face.0, &ask)?;
     if !*modeled {
-        st.threads.push(on.info);
-        return Ok(());
+        return Ok(Ready::Marked(on.info));
     }
     let angle = chamfer_angle.as_deref().map(|e| val(vals, e, Kind::Angle)).transpose()?;
     let depth = chamfer_depth.as_deref().map(|e| val(vals, e, Kind::Length)).transpose()?;
-    if let Some(r) = on.narrow {
-        let note = format!(
-            "narrowed the {} mm hole to {} mm (the {} thread's minor diameter) so the thread has material to cut into",
-            show_mm(2.0 * on.cyl.radius),
-            show_mm(2.0 * r),
-            on.info.designation
-        );
-        *warning = Some(match warning.take() {
-            Some(w) => format!("{w}; {note}"),
-            None => note,
-        });
-    }
-    if let Some(note) = cut(st, on, (*tip, angle, depth))? {
-        *warning = Some(match warning.take() {
-            Some(w) => format!("{w}; {note}"),
-            None => note,
-        });
-    }
-    Ok(())
+    Ok(Ready::Cut { on: Box::new(on), tip: (*tip, angle, depth) })
 }
 
 /// A runout as (mm, pitches): ISO 3508's standard 2.5 P and short 1.25 P, or a length.
@@ -1029,12 +1106,26 @@ pub(super) fn cut(st: &mut ModelState, on: ThreadOn, (tip, angle, depth): (Threa
         let sleeve = kernel::revolve(&plane, &[region], Vec2::new(0.0, 0.0), Vec2::new(0.0, 1.0), std::f64::consts::TAU)?
             .pop()
             .ok_or_else(|| DocError::Invalid("the narrowed bore".into()))?;
-        let faces = sleeve.face_count();
-        let filled =
-            kernel::boolean(&input.body, &sleeve, BoolOp::Union)?.ok_or_else(|| DocError::Invalid("narrowing the hole removed everything".into()))?;
-        let unnamed = crate::lineage::Lineage::unnamed_faces(faces);
-        let lineage = input.lineage.and_then(|l| crate::lineage::Lineage::step(&filled, &[&l, &unnamed]));
-        input = Traced { body: filled, lineage };
+        // Where the hole breaks out through a flat side (past the part's edge, into a slot), the
+        // fill stops at that side: it stands in for material the hole took, never adds any
+        // outside the part.
+        let mut sleeve = Some(sleeve);
+        for (n, d) in kernel::sides_beside_cylinder(&input.body, &cyl) {
+            let Some(unit) = n.normalized() else { continue };
+            let side = Plane::from_normal(unit * d, unit).ok_or_else(|| DocError::Invalid("the side a hole breaks out through".into()))?;
+            sleeve = match sleeve {
+                Some(s) => kernel::half_space(&s, &side, false)?.0,
+                None => None,
+            };
+        }
+        if let Some(sleeve) = sleeve {
+            let faces = sleeve.face_count();
+            let filled = kernel::boolean(&input.body, &sleeve, BoolOp::Union)?
+                .ok_or_else(|| DocError::Invalid("narrowing the hole removed everything".into()))?;
+            let unnamed = crate::lineage::Lineage::unnamed_faces(faces);
+            let lineage = input.lineage.and_then(|l| crate::lineage::Lineage::step(&filled, &[&l, &unnamed]));
+            input = Traced { body: filled, lineage };
+        }
         groove_radius = r_min;
     }
     // The exact grooves: SMLib's screw sweeps, cut by one B-rep boolean.
@@ -1111,7 +1202,9 @@ pub(super) fn cut(st: &mut ModelState, on: ThreadOn, (tip, angle, depth): (Threa
     if let Some((r, r_groove)) = relief_cut {
         // A ring from the relief's radius out past the surface (external), or from inside the
         // bore out to it (internal), over the relief's span, revolved about the axis.
-        let (r0, r1) = if t.internal { (radius - 0.1 * t.pitch, r_groove) } else { (r_groove, radius + 0.1 * t.pitch) };
+        // Inside, from within the bore as it is now: narrowed to the thread's minor diameter, the
+        // ring starting from the hole's own wall left a skin of the fill between bore and groove.
+        let (r0, r1) = if t.internal { (groove_radius.min(radius) - 0.1 * t.pitch, r_groove) } else { (r_groove, radius + 0.1 * t.pitch) };
         if !(r0 > 0.0 && r1 > r0 && r0.is_finite() && r1.is_finite()) {
             return Err(DocError::Invalid("the relief groove is deeper than the shaft".into()));
         }

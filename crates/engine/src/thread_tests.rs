@@ -1578,15 +1578,20 @@ fn a_relief_groove_after_a_length_lies_just_past_the_thread() {
 /// A blind tapped hole's relief: a ring cut out past the thread's root at the hole's bottom.
 #[test]
 fn a_relief_groove_at_a_blind_holes_bottom_cuts_out_past_the_root() {
-    let mut s = Session::default();
-    run(&mut s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 20, "body_name": "Block"}));
-    run(&mut s, "solid.hole", json!({"position": [0, 0, 20], "diameter": 8.5, "depth": 12}));
-    run(&mut s, "solid.thread", json!({"face": [4.25, 0, 14], "designation": "M10", "modeled": true, "relief": true}));
-    let r = relief_radius(true);
-    // The hole's wall runs z 8..20; the relief is its bottom 2.25 mm.
-    let ring = volume_between(&s, "Block", (8.05, 10.2), None);
-    let want = (400.0 - PI * r * r) * 2.15;
-    assert!((ring - want).abs() < want * 1e-6, "the relief slice is {ring}, not {want}");
+    // In a tap-drilled hole, and in one drilled to the thread's size, which the thread narrows to
+    // its minor diameter first: the relief there was cut from the hole's own wall, leaving a skin
+    // of the fill between the bore and the groove.
+    for drill in [8.5, 10.0] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 20, "body_name": "Block"}));
+        run(&mut s, "solid.hole", json!({"position": [0, 0, 20], "diameter": drill, "depth": 12}));
+        run(&mut s, "solid.thread", json!({"face": [drill / 2.0, 0, 14], "designation": "M10", "modeled": true, "relief": true}));
+        let r = relief_radius(true);
+        // The hole's wall runs z 8..20; the relief is its bottom 2.25 mm.
+        let ring = volume_between(&s, "Block", (8.05, 10.2), None);
+        let want = (400.0 - PI * r * r) * 2.15;
+        assert!((ring - want).abs() < want * 1e-6, "{drill} mm hole: the relief slice is {ring}, not {want}");
+    }
 }
 
 /// A relief is refused where it can't go, with the reason, and nothing is added.
@@ -1705,4 +1710,104 @@ fn a_bolt_thread_made_to_a_fit_is_cut_to_the_design_root() {
     };
     let (plain, classed) = (nut(json!({})), nut(json!({"tolerance_class": "6H"})));
     assert!((plain - classed).abs() < 1e-9 * plain, "a 6H nut {classed}, without a class {plain}");
+}
+
+/// A plate with one tapped M6 hole, its threads cosmetic or modelled, and with three copies of the
+/// hole patterned along X: `(threads marked, plate volume)`.
+fn patterned_tapped_hole(modeled: bool, pattern: bool) -> (usize, f64) {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 20, "height": 10, "body_name": "Plate"}));
+    let mut hole = json!({"position": [10, 10, 10], "direction": [0, 0, -1], "thread": "M6", "depth": 8, "name": "H"});
+    if modeled {
+        hole["modeled"] = json!(true);
+    }
+    run(&mut s, "solid.hole", hole.clone());
+    if pattern {
+        run(&mut s, "solid.pattern.rectangular", json!({"features": ["H"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 15, "name": "Row"}));
+    } else {
+        for x in [25, 40] {
+            hole["position"] = json!([x, 10, 10]);
+            hole["name"] = json!(format!("H{x}"));
+            run(&mut s, "solid.hole", hole.clone());
+        }
+    }
+    (s.model.state().threads.len(), volume(&mut s, "Plate"))
+}
+
+/// A pattern of a tapped hole taps every copy, as three tapped holes would be: the copies were
+/// drilled to the tap drill and left unthreaded.
+#[test]
+fn a_patterned_tapped_hole_taps_every_copy() {
+    assert_eq!(patterned_tapped_hole(false, true).0, 3, "cosmetic threads on a pattern of a tapped hole");
+    let (_, patterned) = patterned_tapped_hole(true, true);
+    let (_, three) = patterned_tapped_hole(true, false);
+    assert!((patterned - three).abs() < 1e-6 * three, "a patterned modelled tapped hole leaves {patterned}, three holes {three}");
+}
+
+/// A plate with a 5 mm blind hole and a modelled M6 thread with a relief groove at its bottom in
+/// it, then two more of each: patterned along X with the hole, or made one by one. The plate's
+/// volume.
+fn patterned_hole_and_thread(pattern: bool) -> f64 {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 20, "height": 12, "body_name": "Plate"}));
+    let xs: &[f64] = if pattern { &[10.0] } else { &[10.0, 25.0, 40.0] };
+    for (i, x) in xs.iter().enumerate() {
+        run(&mut s, "solid.hole", json!({"position": [x, 10, 12], "direction": [0, 0, -1], "diameter": 5, "depth": 10, "name": format!("H{i}")}));
+        let thread = json!({"face": [x + 2.5, 10, 8], "designation": "M6", "length": 6, "from": [x + 2.5, 10, 12], "modeled": true, "relief": true, "name": format!("T{i}")});
+        run(&mut s, "solid.thread", thread);
+    }
+    if pattern {
+        run(&mut s, "solid.pattern.rectangular", json!({"features": ["T0", "H0"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 15, "name": "Row"}));
+    }
+    exact_volume(&s, "Plate")
+}
+
+/// A thread is patterned with the hole it is in: each copy of the hole gets the thread, its
+/// relief groove too, as the same hole and thread made three times. A thread could not be
+/// patterned or mirrored at all.
+#[test]
+fn a_hole_and_its_thread_pattern_together() {
+    let (patterned, three) = (patterned_hole_and_thread(true), patterned_hole_and_thread(false));
+    assert!((patterned - three).abs() < 1e-6 * three, "patterned {patterned}, three made one by one {three}");
+}
+
+/// A thread in a hole that breaks out through the part's side adds nothing outside the part: a
+/// hole drilled to the thread's size is narrowed to its minor diameter first, and that fill ran
+/// past the side (an M5 at 1 mm from the edge of a 20 mm block reached x = 21.6). A tapped hole,
+/// drilled to the tap size, never narrows.
+#[test]
+fn a_thread_in_a_hole_breaking_out_of_the_part_adds_nothing_outside_it() {
+    let block = || {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 12, "body_name": "Block"}));
+        s
+    };
+    let at = json!({"position": [19, 10, 12], "direction": [0, 0, -1], "depth": 8});
+    let with = |extra: Value| {
+        let mut p = at.clone();
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        p
+    };
+    let narrowed = json!({"face": [16.5, 10, 6], "modeled": true});
+    let fitted = json!({"face": [16.5, 10, 6], "modeled": true, "clearance": "0.6", "tolerance_class": "6H/6g", "relief": true, "tip": "start"});
+    // (the hole, the thread on it if any, the same hole left plain)
+    let cases = [
+        (with(json!({"thread": "M5", "modeled": true})), None, with(json!({"diameter": 4.2}))),
+        (with(json!({"diameter": 5})), Some(narrowed), with(json!({"diameter": 5}))),
+        (with(json!({"diameter": 5})), Some(fitted), with(json!({"diameter": 5}))),
+    ];
+    for (hole, thread, plain) in cases {
+        let mut s = block();
+        run(&mut s, "solid.hole", hole);
+        if let Some(t) = &thread {
+            run(&mut s, "solid.thread", t.clone());
+        }
+        let b = s.model.state().body("Block").unwrap().body.exact_bounds().unwrap();
+        assert!(b.max.x <= 20.0 + 1e-6 && b.max.y <= 20.0 + 1e-6 && b.max.z <= 12.0 + 1e-6, "{thread:?}: the block now reaches {:?}", b.max);
+        // The thread is still there where there is wall: the block is not the plain hole's.
+        let mut p = block();
+        run(&mut p, "solid.hole", plain);
+        let (threaded, bare) = (exact_volume(&s, "Block"), exact_volume(&p, "Block"));
+        assert!((threaded - bare).abs() > 1.0, "{thread:?}: no thread ({threaded} mm³, the plain hole leaves {bare} mm³)");
+    }
 }
