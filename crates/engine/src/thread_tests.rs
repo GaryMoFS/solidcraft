@@ -1554,25 +1554,33 @@ fn a_relief_groove_at_a_shoulder_leaves_a_plain_neck_and_the_collar_whole() {
 
 /// With a length, the relief lies just past the thread's end: the thread keeps its length, the
 /// neck below it is a plain cylinder, and the shaft below the neck is untouched (the groove's
-/// square stop was cut away with the neck).
+/// square stop was cut away with the neck). With a clearance too: the shaft is turned down only
+/// along the thread, and the relief past it was cut out only to the turned-down radius, leaving a
+/// skin of the shaft's own diameter over the groove.
 #[test]
 fn a_relief_groove_after_a_length_lies_just_past_the_thread() {
-    let mut s = shaft_on_collar();
-    run(
-        &mut s,
-        "solid.thread",
-        json!({"face": [5, 0, 30], "designation": "M10", "length": 10, "modeled": true, "relief": {"width": "3 mm", "depth": "0.2 mm"}}),
-    );
-    let root = solidcraft_doc::thread_forms::ThreadForm::Metric.groove(10.0, 1.5, false).root_r;
-    let r = root - 0.2;
-    // The thread runs z 25..35, the neck z 22..25.
-    let neck = volume_between(&s, "Part", (22.05, 24.95), None);
-    let want = PI * r * r * 2.9;
-    assert!((neck - want).abs() < want * 1e-6, "the neck is {neck}, not {want}");
-    let plain = volume_between(&s, "Part", (11.0, 21.95), None);
-    assert!((plain - PI * 25.0 * 10.95).abs() < 1e-6 * PI * 25.0 * 10.95, "the shaft below the neck lost {} mm³", PI * 25.0 * 10.95 - plain);
-    let thread = volume_between(&s, "Part", (26.0, 33.5), None);
-    assert!(thread < PI * 25.0 * 7.5 * 0.95, "the thread is cut above the neck: {thread}");
+    for clearance in [None, Some(0.6)] {
+        let mut s = shaft_on_collar();
+        let mut p = json!({"face": [5, 0, 30], "designation": "M10", "length": 10, "modeled": true, "relief": {"width": "3 mm", "depth": "0.2 mm"}});
+        if let Some(c) = clearance {
+            p["clearance"] = json!(c);
+        }
+        run(&mut s, "solid.thread", p);
+        let groove = match clearance {
+            None => solidcraft_doc::thread_forms::ThreadForm::Metric.groove(10.0, 1.5, false),
+            Some(c) => solidcraft_doc::thread_forms::ThreadForm::Metric.groove_with(10.0 - c, 1.5, false, true),
+        };
+        let r = groove.root_r - 0.2;
+        // The thread runs z 25..35, the neck z 22..25.
+        let neck = volume_between(&s, "Part", (22.05, 24.95), None);
+        let want = PI * r * r * 2.9;
+        assert!((neck - want).abs() < want * 1e-6, "clearance {clearance:?}: the neck is {neck}, not {want}");
+        let plain = volume_between(&s, "Part", (11.0, 21.95), None);
+        let full = PI * 25.0 * 10.95;
+        assert!((plain - full).abs() < 1e-6 * full, "clearance {clearance:?}: the shaft below the neck lost {} mm³", full - plain);
+        let thread = volume_between(&s, "Part", (26.0, 33.5), None);
+        assert!(thread < PI * 25.0 * 7.5 * 0.95, "clearance {clearance:?}: the thread is cut above the neck: {thread}");
+    }
 }
 
 /// A blind tapped hole's relief: a ring cut out past the thread's root at the hole's bottom.
@@ -1580,17 +1588,23 @@ fn a_relief_groove_after_a_length_lies_just_past_the_thread() {
 fn a_relief_groove_at_a_blind_holes_bottom_cuts_out_past_the_root() {
     // In a tap-drilled hole, and in one drilled to the thread's size, which the thread narrows to
     // its minor diameter first: the relief there was cut from the hole's own wall, leaving a skin
-    // of the fill between the bore and the groove.
-    for drill in [8.5, 10.0] {
+    // of the fill between the bore and the groove. And with a clearance, which opens the hole up
+    // only along the thread: the relief past it started from the opened-up radius.
+    for (drill, clearance) in [(8.5, None), (10.0, None), (8.5, Some(0.6))] {
         let mut s = Session::default();
         run(&mut s, "solid.box", json!({"corner": [-10, -10, 0], "length": 20, "width": 20, "height": 20, "body_name": "Block"}));
         run(&mut s, "solid.hole", json!({"position": [0, 0, 20], "diameter": drill, "depth": 12}));
-        run(&mut s, "solid.thread", json!({"face": [drill / 2.0, 0, 14], "designation": "M10", "modeled": true, "relief": true}));
-        let r = relief_radius(true);
+        let mut p = json!({"face": [drill / 2.0, 0, 14], "designation": "M10", "modeled": true, "relief": true});
+        if let Some(c) = clearance {
+            p["clearance"] = json!(c);
+        }
+        run(&mut s, "solid.thread", p);
+        // The relief is 0.1 P past the root, which a clearance moves out by half of it.
+        let r = relief_radius(true) + clearance.unwrap_or(0.0) / 2.0;
         // The hole's wall runs z 8..20; the relief is its bottom 2.25 mm.
         let ring = volume_between(&s, "Block", (8.05, 10.2), None);
         let want = (400.0 - PI * r * r) * 2.15;
-        assert!((ring - want).abs() < want * 1e-6, "{drill} mm hole: the relief slice is {ring}, not {want}");
+        assert!((ring - want).abs() < want * 1e-6, "{drill} mm hole, clearance {clearance:?}: the relief slice is {ring}, not {want}");
     }
 }
 

@@ -1063,6 +1063,9 @@ pub(super) fn cut(st: &mut ModelState, on: ThreadOn, (tip, angle, depth): (Threa
     let Some(mb) = st.bodies.get(i).cloned() else { return Err(DocError::Invalid("body".into())) };
     let mut input = mb.traced();
     let mut radius = cyl.radius;
+    // The face's own radius: a clearance turns the face down (or opens it up) only along the
+    // thread, and a relief past the thread's end meets the face as it was.
+    let face_radius = cyl.radius;
     if clearance > 0.0 {
         let radial = clearance / 2.0;
         let r0 = if cyl.internal { radius - 0.1 * t.pitch } else { radius - radial };
@@ -1204,7 +1207,13 @@ pub(super) fn cut(st: &mut ModelState, on: ThreadOn, (tip, angle, depth): (Threa
         // bore out to it (internal), over the relief's span, revolved about the axis.
         // Inside, from within the bore as it is now: narrowed to the thread's minor diameter, the
         // ring starting from the hole's own wall left a skin of the fill between bore and groove.
-        let (r0, r1) = if t.internal { (groove_radius.min(radius) - 0.1 * t.pitch, r_groove) } else { (r_groove, radius + 0.1 * t.pitch) };
+        // Outside, out past the face's own radius: beyond the thread a clearance has not turned it
+        // down, and a ring to the turned-down radius left a skin of the shaft over the groove.
+        let (r0, r1) = if t.internal {
+            (groove_radius.min(radius).min(face_radius) - 0.1 * t.pitch, r_groove)
+        } else {
+            (r_groove, radius.max(face_radius) + 0.1 * t.pitch)
+        };
         if !(r0 > 0.0 && r1 > r0 && r0.is_finite() && r1.is_finite()) {
             return Err(DocError::Invalid("the relief groove is deeper than the shaft".into()));
         }
