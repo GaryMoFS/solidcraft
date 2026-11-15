@@ -28,6 +28,10 @@ pub struct ThreadInfo {
     pub hand: ThreadHand,
     #[serde(default = "crate::thread_forms::one_start")]
     pub starts: u32,
+    /// A modelled external metric thread cut to ISO 724's design root (17H/24), not the basic
+    /// profile's 5H/8: a thread given a tolerance class or a clearance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub design_root: bool,
 }
 
 /// Nominal diameters and coarse pitches (mm) used for automatic ISO metric thread sizing.
@@ -92,6 +96,13 @@ pub(super) struct ThreadAsk<'a> {
     /// A design saved before holes were sized by their nominal diameter: with no designation, a
     /// hole is matched by its tap drill alone ([`ThreadForm::fit_with`]), so it keeps its size.
     pub old_auto_size: bool,
+    /// Positive diametral allowance: opens an internal thread or turns down an external one.
+    pub clearance: f64,
+    /// A relief groove at the inner end: (width, radial depth past the root), each `None` for
+    /// its default (1.5 P, 0.1 P).
+    pub relief: Option<(Option<f64>, Option<f64>)>,
+    /// Cut an external metric thread to ISO 724's design root (a thread made to a fit).
+    pub design_root: bool,
 }
 
 /// How one end of a thread's length meets its face.
@@ -126,9 +137,14 @@ pub(super) struct ThreadOn {
     /// A modelled internal thread in a hole wider than it needs: the radius the bore is narrowed
     /// to (the thread's minor radius) before the groove is cut, with the hole's own radius.
     narrow: Option<f64>,
+    clearance: f64,
+    /// The relief groove at the inner end, if one was asked for.
+    relief: Option<Relief>,
     /// A shoulder keeps the square stop because the kernel couldn't check whether it stays beyond
     /// the face's end.
     shoulder_unchecked: bool,
+    /// The end the thread starts from was picked (`from`), not left to the default.
+    picked: bool,
 }
 
 /// The free-end test of a face's two ends (`side` 0 at its start, 1 at its end), each made
@@ -186,6 +202,21 @@ impl FaceEnds<'_> {
     }
 }
 
+/// A relief groove resolved on its face.
+#[derive(Clone, Copy, Debug)]
+struct Relief {
+    /// Its span along the axis.
+    lo: f64,
+    hi: f64,
+    /// Its radial depth past the thread's root.
+    depth: f64,
+    /// The inner end (0: the axis' low end, 1: its high end) and where the thread's groove stops
+    /// there when it stops partway along the face: inside the relief, so its square stop is cut
+    /// away with it.
+    side: usize,
+    stop: f64,
+}
+
 /// A thread on the cylindrical face at `p`: its size, and the part of the face it runs over.
 pub(super) fn thread_on(st: &ModelState, feature: u64, p: Vec3, ask: &ThreadAsk) -> Result<ThreadOn> {
     thread_on_in(st, feature, None, p, ask)
@@ -196,6 +227,18 @@ pub(super) fn thread_on(st: &ModelState, feature: u64, p: Vec3, ask: &ThreadAsk)
 /// coordinates, so two parts built alike (two screws of one size) each have a face at the same
 /// point, and without this the second part's thread went on the first part's body.
 pub(super) fn thread_on_in(st: &ModelState, feature: u64, component: Option<u64>, p: Vec3, ask: &ThreadAsk) -> Result<ThreadOn> {
+    if !(ask.clearance >= 0.0 && ask.clearance.is_finite()) {
+        return Err(DocError::Invalid("thread modeling clearance must be finite and non-negative".into()));
+    }
+    if ask.clearance > 0.0 && !ask.modeled {
+        return Err(DocError::Invalid("thread modeling clearance requires a modeled thread".into()));
+    }
+    if ask.relief.is_some() && !ask.modeled {
+        return Err(DocError::Invalid("a relief groove is cut only on a modelled thread".into()));
+    }
+    if ask.relief.is_some() && (ask.ease_out.0 > 0.0 || ask.ease_out.1 > 0.0) {
+        return Err(DocError::Invalid("a thread's inner end takes a relief groove or a runout (fade), not both".into()));
+    }
     let found: Vec<(usize, kernel::CylinderFace)> = st
         .bodies
         .iter()
@@ -395,7 +438,66 @@ pub(super) fn thread_on_in(st: &ModelState, feature: u64, component: Option<u64>
             End::Inside
         })
     };
-    let ends = [kind(a, 0)?, kind(b, 1)?];
+    let mut ends = [kind(a, 0)?, kind(b, 1)?];
+    let relief = match ask.relief {
+        None => None,
+        Some((width, depth)) => {
+            if form.is_taper() {
+                return Err(DocError::Invalid("a taper pipe thread takes no relief groove".into()));
+            }
+            // The inner end, away from where the thread starts. A thread over the whole face
+            // starts from either end: its inner end is the one that isn't free (a shoulder, a
+            // hole's bottom), else the one away from the end picked.
+            let whole = (a - lo).abs() < pitch * 1e-3 && (hi - b).abs() < pitch * 1e-3;
+            let inner = match (whole, ends[0] == End::Free, ends[1] == End::Free) {
+                (true, true, false) => 1,
+                (true, false, true) => 0,
+                _ => 1 - side.min(1),
+            };
+            let w = width.unwrap_or(1.5 * pitch);
+            let depth = depth.unwrap_or(0.1 * pitch);
+            if !(w.is_finite() && w >= pitch * (1.0 - 1e-9)) {
+                return Err(DocError::Invalid(format!(
+                    "a relief groove is at least one pitch ({} mm) wide, so the thread runs out into it",
+                    show_mm(pitch)
+                )));
+            }
+            if !(depth.is_finite() && depth >= 0.0) {
+                return Err(DocError::Invalid("a relief groove's depth is a length of zero or more past the thread's root".into()));
+            }
+            let (r_lo, r_hi) = match ends.get(inner).copied().unwrap_or(End::Free) {
+                End::Free => {
+                    return Err(DocError::Invalid(
+                        "a relief groove goes where the thread ends against material (a shoulder, a blind hole's bottom, or partway along the face with a length); this thread's inner end runs off a free end of the face"
+                            .into(),
+                    ));
+                }
+                // Partway along the face: included at the inner end of the thread's length.
+                End::Inside if inner == 1 => (b - w, b),
+                End::Inside => (a, a + w),
+                // Against the shoulder or the hole's bottom.
+                _ if inner == 1 => (hi - w, hi),
+                _ => (lo, lo + w),
+            };
+            // The thread keeps some full-form length before its relief.
+            let keeps = if inner == 1 { r_lo - a } else { b - r_hi };
+            if !(keeps > pitch * 1e-3) {
+                return Err(DocError::Invalid(format!(
+                    "a relief groove {} mm wide leaves this thread no length: make it narrower or the thread longer",
+                    show_mm(w)
+                )));
+            }
+            // At a shoulder or a hole's bottom the groove stops clear of it as a square stop
+            // does, and the relief takes its last turn away; the trim to the shoulder's plane
+            // isn't needed.
+            if let Some(end) = ends.get_mut(inner)
+                && *end == End::Shoulder
+            {
+                *end = End::Closed;
+            }
+            Some(Relief { lo: r_lo, hi: r_hi, depth, side: inner, stop: 0.5 * (r_lo + r_hi) })
+        }
+    };
     if form.is_taper() && ask.modeled && ends.get(side) != Some(&End::Free) {
         return Err(DocError::Invalid(format!(
             "a taper pipe thread starts at a free end, the pipe's end or the {}: start it there (`from`, a point near that end)",
@@ -417,6 +519,7 @@ pub(super) fn thread_on_in(st: &ModelState, feature: u64, component: Option<u64>
         form,
         hand: ask.hand,
         starts,
+        design_root: ask.design_root,
     };
     // A hole already as wide as the thread's major diameter (a 12 mm hole for M12) has no wall to
     // cut a groove into: the bore is narrowed to the thread's minor diameter first.
@@ -424,7 +527,19 @@ pub(super) fn thread_on_in(st: &ModelState, feature: u64, component: Option<u64>
         .then(|| form.groove(major, pitch, true))
         .filter(|g| !(g.root_r - cyl.radius >= g.basic_depth / 4.0))
         .map(|g| g.crest_r);
-    Ok(ThreadOn { info, cyl, ends, steep: ask.steep, ease, from: side, narrow, shoulder_unchecked: unchecked })
+    Ok(ThreadOn {
+        info,
+        cyl,
+        ends,
+        steep: ask.steep,
+        ease,
+        from: side,
+        narrow,
+        clearance: ask.clearance,
+        relief,
+        shoulder_unchecked: unchecked,
+        picked: ask.from.is_some(),
+    })
 }
 
 /// The end of the face (0: its start, 1: its end) a thread of limited length starts at: the end
@@ -508,7 +623,7 @@ fn thread_grooves(
     };
     let d = taper.map_or(d, |(d0, _)| d0);
     let profile = |d: f64| {
-        let mut g = form.groove(d, p, t.internal);
+        let mut g = form.groove_with(d, p, t.internal, t.design_root);
         if steep == SteepFlank::Start {
             std::mem::swap(&mut g.flank_lo, &mut g.flank_hi);
         }
@@ -774,6 +889,102 @@ fn trim_at_shoulders(mut tool: Body, axis: Vec3, ends: [End; 2], face: (f64, f64
 /// Evaluate a thread feature: a cosmetic thread is listed in the model's threads, a modelled
 /// one cut into its body.
 pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st: &mut ModelState, warning: &mut Option<String>) -> Result<()> {
+    let ready = prepare(doc, vals, f, st)?;
+    finish(st, ready, warning)
+}
+
+/// A thread feature worked out on the state it starts from, before anything is cut: what
+/// [`finish`] marks or cuts. A pattern's copies are all worked out first on the part as drilled,
+/// which is meshed once for all of them, then cut one after another.
+pub(super) enum Ready {
+    /// A cosmetic thread, listed in the model's threads.
+    Marked(ThreadInfo),
+    /// A modelled thread, with its chamfered tip (and its angle and depth when given).
+    Cut { on: Box<ThreadOn>, tip: (ThreadTip, Option<f64>, Option<f64>), continuous_flanks: bool },
+}
+
+impl Ready {
+    /// The box (lowest and highest corner) a modelled thread's cuts stay within: its face's
+    /// length along the axis and a little beyond, and its diameter and more around it. `None`
+    /// for a cosmetic thread, which cuts nothing.
+    pub(super) fn reach(&self) -> Option<(Vec3, Vec3)> {
+        let Ready::Cut { on, .. } = self else { return None };
+        on.reach()
+    }
+}
+
+impl ThreadOn {
+    /// [`Ready::reach`] of this thread.
+    pub(super) fn reach(&self) -> Option<(Vec3, Vec3)> {
+        let t = &self.info;
+        let k = *t.axis;
+        let margin = 2.0 * t.pitch + self.clearance + 1.0;
+        let r = t.major_diameter.max(2.0 * self.cyl.radius) + margin;
+        let a = t.axis_point + k * (self.cyl.start.min(t.start) - margin);
+        let b = t.axis_point + k * (self.cyl.end.max(t.end) + margin);
+        // A disc of radius r across the axis reaches r * sqrt(1 - k_i^2) along each axis i.
+        let half = Vec3::new(r * (1.0 - k.x * k.x).max(0.0).sqrt(), r * (1.0 - k.y * k.y).max(0.0).sqrt(), r * (1.0 - k.z * k.z).max(0.0).sqrt());
+        let lo = Vec3::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z)) - half;
+        let hi = Vec3::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z)) + half;
+        (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
+    }
+}
+
+/// Whether any two of `reaches` (modelled threads' boxes, see [`ThreadOn::reach`]) meet, or one
+/// is unknown: their threads are then worked out one after another, each on the part the last
+/// one left, as a feature at a time would.
+pub(super) fn reaches_meet(reaches: &[Option<(Vec3, Vec3)>]) -> bool {
+    let known: Vec<(Vec3, Vec3)> = reaches.iter().flatten().copied().collect();
+    if known.len() < reaches.iter().filter(|r| r.is_some()).count() {
+        return true;
+    }
+    known.iter().enumerate().any(|(i, (a0, a1))| {
+        known.iter().skip(i + 1).any(|(b0, b1)| a0.x <= b1.x && b0.x <= a1.x && a0.y <= b1.y && b0.y <= a1.y && a0.z <= b1.z && b0.z <= a1.z)
+    })
+}
+
+/// A copy of `st` whose bodies keep the meshes made of them: the walls of many copies found on
+/// one part mesh it once.
+pub(super) fn probe_state(st: &ModelState) -> ModelState {
+    let mut probe = st.clone();
+    for b in &mut probe.bodies {
+        b.body = b.body.keeping_meshes();
+    }
+    probe
+}
+
+/// Marks or cuts what [`prepare`] worked out.
+pub(super) fn finish(st: &mut ModelState, ready: Ready, warning: &mut Option<String>) -> Result<()> {
+    let (on, tip, continuous_flanks) = match ready {
+        Ready::Marked(info) => {
+            st.threads.push(info);
+            return Ok(());
+        }
+        Ready::Cut { on, tip, continuous_flanks } => (*on, tip, continuous_flanks),
+    };
+    if let Some(r) = on.narrow {
+        let note = format!(
+            "narrowed the {} mm hole to {} mm (the {} thread's minor diameter) so the thread has material to cut into",
+            show_mm(2.0 * on.cyl.radius),
+            show_mm(2.0 * r),
+            on.info.designation
+        );
+        *warning = Some(match warning.take() {
+            Some(w) => format!("{w}; {note}"),
+            None => note,
+        });
+    }
+    if let Some(note) = cut_with_flanks(st, on, tip, continuous_flanks)? {
+        *warning = Some(match warning.take() {
+            Some(w) => format!("{w}; {note}"),
+            None => note,
+        });
+    }
+    Ok(())
+}
+
+/// Works out thread feature `f` on `st`, cutting nothing: see [`Ready`].
+pub(super) fn prepare(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st: &ModelState) -> Result<Ready> {
     let FeatureKind::Thread {
         face,
         designation,
@@ -790,6 +1001,9 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
         chamfer_angle,
         chamfer_depth,
         steep_flank,
+        tolerance_class,
+        clearance,
+        relief,
         old_auto_size,
     } = &f.kind
     else {
@@ -818,37 +1032,30 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
         ease_out: (0.0, 0.0),
         tapped: false,
         old_auto_size: *old_auto_size,
+        // Set below, once the clearance is known.
+        design_root: false,
+        clearance: clearance.as_ref().map(|e| val(vals, e, Kind::Length)).transpose()?.unwrap_or(0.0),
+        relief: match relief {
+            None => None,
+            Some(r) => Some((
+                r.width.as_ref().map(|e| val(vals, e, Kind::Length)).transpose()?,
+                r.depth.as_ref().map(|e| val(vals, e, Kind::Length)).transpose()?,
+            )),
+        },
     };
     if ease_out.is_some() && !*modeled {
         return Err(DocError::Invalid("a runout is cut only on a modelled thread".into()));
     }
-    let ask = ThreadAsk { ease_out: runout(vals, ease_out)?, ..ask };
+    // A thread made to a fit (a tolerance class, or a clearance) is cut to the design root.
+    let design_root = tolerance_class.is_some() || ask.clearance > 0.0;
+    let ask = ThreadAsk { ease_out: runout(vals, ease_out)?, design_root, ..ask };
     let on = thread_on_in(st, f.id, Some(f.component), face.0, &ask)?;
     if !*modeled {
-        st.threads.push(on.info);
-        return Ok(());
+        return Ok(Ready::Marked(on.info));
     }
     let angle = chamfer_angle.as_deref().map(|e| val(vals, e, Kind::Angle)).transpose()?;
     let depth = chamfer_depth.as_deref().map(|e| val(vals, e, Kind::Length)).transpose()?;
-    if let Some(r) = on.narrow {
-        let note = format!(
-            "narrowed the {} mm hole to {} mm (the {} thread's minor diameter) so the thread has material to cut into",
-            show_mm(2.0 * on.cyl.radius),
-            show_mm(2.0 * r),
-            on.info.designation
-        );
-        *warning = Some(match warning.take() {
-            Some(w) => format!("{w}; {note}"),
-            None => note,
-        });
-    }
-    if let Some(note) = cut_with_flanks(st, on, (*tip, angle, depth), *continuous_flanks)? {
-        *warning = Some(match warning.take() {
-            Some(w) => format!("{w}; {note}"),
-            None => note,
-        });
-    }
-    Ok(())
+    Ok(Ready::Cut { on: Box::new(on), tip: (*tip, angle, depth), continuous_flanks: *continuous_flanks })
 }
 
 /// A runout as (mm, pitches): ISO 3508's standard 2.5 P and short 1.25 P, or a length.
@@ -873,14 +1080,46 @@ fn cut_with_flanks(
     (tip, angle, depth): (ThreadTip, Option<f64>, Option<f64>),
     continuous_flanks: bool,
 ) -> Result<Option<String>> {
-    let ThreadOn { info: t, cyl, ends, steep, ease, from: from_side, narrow, shoulder_unchecked } = on;
+    let ThreadOn { info: mut t, mut cyl, ends, steep, ease, from: from_side, narrow, clearance, relief, shoulder_unchecked, picked } = on;
     let i = st.bodies.iter().position(|b| b.name == t.body).ok_or_else(|| DocError::Invalid("threaded body".into()))?;
     let Some(mb) = st.bodies.get(i).cloned() else { return Err(DocError::Invalid("body".into())) };
-    let (mut input, radius) = (mb.traced(), cyl.radius);
+    let mut input = mb.traced();
+    let mut radius = cyl.radius;
+    // The face's own radius: a clearance turns the face down (or opens it up) only along the
+    // thread, and a relief past the thread's end meets the face as it was.
+    let face_radius = cyl.radius;
+    if clearance > 0.0 {
+        let radial = clearance / 2.0;
+        let r0 = if cyl.internal { radius - 0.1 * t.pitch } else { radius - radial };
+        let r1 = if cyl.internal { radius + radial } else { radius + 0.1 * t.pitch };
+        if !(r0 > 0.0 && r1 > r0 && r0.is_finite() && r1.is_finite()) {
+            return Err(DocError::Invalid("thread modeling clearance leaves no usable radius".into()));
+        }
+        let k = *t.axis;
+        let u = k.cross(if k.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) });
+        let u = u.normalized().ok_or_else(|| DocError::Invalid("thread axis".into()))?;
+        let lo = t.start.max(cyl.start);
+        let hi = t.end.min(cyl.end);
+        let plane = Plane { origin: t.axis_point + k * lo, x: u, y: k };
+        let pts = [Vec2::new(r0, 0.0), Vec2::new(r1, 0.0), Vec2::new(r1, hi - lo), Vec2::new(r0, hi - lo)];
+        let region = Region2 { outer: solidcore_record::Loop2::polygon(&pts), holes: Vec::new() };
+        let tool = kernel::revolve(&plane, &[region], Vec2::new(0.0, 0.0), Vec2::new(0.0, 1.0), std::f64::consts::TAU)?
+            .pop()
+            .ok_or_else(|| DocError::Invalid("the thread clearance".into()))?;
+        let cut =
+            kernel::boolean(&input.body, &tool, BoolOp::Cut)?.ok_or_else(|| DocError::Invalid("the thread clearance removed everything".into()))?;
+        let unnamed = crate::lineage::Lineage::unnamed_faces(tool.face_count());
+        let lineage = input.lineage.and_then(|l| crate::lineage::Lineage::step(&cut, &[&l, &unnamed]));
+        input = Traced { body: cut, lineage, recipe: None };
+        let sign = if cyl.internal { 1.0 } else { -1.0 };
+        t.major_diameter += sign * clearance;
+        cyl.radius += sign * radial;
+        radius = cyl.radius;
+    }
     // A hole wider than the thread needs is filled in to the thread's minor radius over the
     // threaded length first, so the groove has the wall to cut into.
     let mut groove_radius = radius;
-    if let Some(r_min) = narrow {
+    if let Some(r_min) = narrow.map(|r| r + if clearance > 0.0 { clearance / 2.0 } else { 0.0 }) {
         let (lo, hi) = ((t.start - ease[0]).max(cyl.start), (t.end + ease[1]).min(cyl.end));
         let k = *t.axis;
         let u = k.cross(if k.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) });
@@ -908,12 +1147,26 @@ fn cut_with_flanks(
             )));
         }
         let sleeve = ring(r_min, r_out, 0.0, hi - lo)?;
-        let faces = sleeve.face_count();
-        let filled =
-            kernel::boolean(&input.body, &sleeve, BoolOp::Union)?.ok_or_else(|| DocError::Invalid("narrowing the hole removed everything".into()))?;
-        let unnamed = crate::lineage::Lineage::unnamed_faces(faces);
-        let lineage = input.lineage.and_then(|l| crate::lineage::Lineage::step(&filled, &[&l, &unnamed]));
-        input = Traced { body: filled, lineage, recipe: None };
+        // Where the hole breaks out through a flat side (past the part's edge, into a slot), the
+        // fill stops at that side: it stands in for material the hole took, never adds any
+        // outside the part.
+        let mut sleeve = Some(sleeve);
+        for (n, d) in kernel::sides_beside_cylinder(&input.body, &cyl) {
+            let Some(unit) = n.normalized() else { continue };
+            let side = Plane::from_normal(unit * d, unit).ok_or_else(|| DocError::Invalid("the side a hole breaks out through".into()))?;
+            sleeve = match sleeve {
+                Some(s) => kernel::half_space(&s, &side, false)?.0,
+                None => None,
+            };
+        }
+        if let Some(sleeve) = sleeve {
+            let faces = sleeve.face_count();
+            let filled = kernel::boolean(&input.body, &sleeve, BoolOp::Union)?
+                .ok_or_else(|| DocError::Invalid("narrowing the hole removed everything".into()))?;
+            let unnamed = crate::lineage::Lineage::unnamed_faces(faces);
+            let lineage = input.lineage.and_then(|l| crate::lineage::Lineage::step(&filled, &[&l, &unnamed]));
+            input = Traced { body: filled, lineage, recipe: None };
+        }
         groove_radius = r_min;
     }
     // The exact grooves: SMLib's screw sweeps, cut by one B-rep boolean.
@@ -926,10 +1179,26 @@ fn cut_with_flanks(
         }
         false => None,
     };
+    // The relief's radius: the thread's root (after any clearance) and its depth past it. A
+    // thread that stops partway along the face runs its groove on into the relief and stops
+    // square there, so the relief takes the square stop away.
+    let relief_cut = relief.map(|r| {
+        let root = t.form.groove_with(t.major_diameter, t.pitch, t.internal, t.design_root).root_r;
+        (r, if t.internal { root + r.depth } else { root - r.depth })
+    });
+    if let Some(r) = relief
+        && ends.get(r.side) == Some(&End::Inside)
+    {
+        if r.side == 1 {
+            t.end = r.stop;
+        } else {
+            t.start = r.stop;
+        }
+    }
     // Preserve historical construction order when rebuilding an older feature.
     let chamfer = |mut input: Traced| -> Result<Traced> {
         if tip != ThreadTip::None {
-            for cone in tip_cones(&t, radius, ends, (tip, from_side), angle, depth, taper)? {
+            for cone in tip_cones(&t, radius, ends, (tip, from_side, picked), angle, depth, taper)? {
                 let faces = cone.face_count();
                 let cut =
                     kernel::boolean(&input.body, &cone, BoolOp::Cut)?.ok_or_else(|| DocError::Invalid("the chamfer removed everything".into()))?;
@@ -987,7 +1256,33 @@ fn cut_with_flanks(
     // The groove's faces have no role to name them by.
     let groove = crate::lineage::Lineage::unnamed_faces(groove_faces);
     let lineage = input.lineage.and_then(|l| crate::lineage::Lineage::step(&nb, &[&l, &groove]));
-    let nb = Traced { body: nb, lineage, recipe: None };
+    let mut nb = Traced { body: nb, lineage, recipe: None };
+    if let Some((r, r_groove)) = relief_cut {
+        // A ring from the relief's radius out past the surface (external), or from inside the
+        // bore out to it (internal), over the relief's span, revolved about the axis.
+        let (r0, r1) = if t.internal {
+            (groove_radius.min(radius).min(face_radius) - 0.1 * t.pitch, r_groove)
+        } else {
+            (r_groove, radius.max(face_radius) + 0.1 * t.pitch)
+        };
+        if !(r0 > 0.0 && r1 > r0 && r0.is_finite() && r1.is_finite()) {
+            return Err(DocError::Invalid("the relief groove is deeper than the shaft".into()));
+        }
+        let k = *t.axis;
+        let u = k.cross(if k.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) });
+        let u = u.normalized().ok_or_else(|| DocError::Invalid("thread axis".into()))?;
+        let plane = Plane { origin: t.axis_point + k * r.lo, x: u, y: k };
+        let pts = [Vec2::new(r0, 0.0), Vec2::new(r1, 0.0), Vec2::new(r1, r.hi - r.lo), Vec2::new(r0, r.hi - r.lo)];
+        let region = Region2 { outer: solidcore_record::Loop2::polygon(&pts), holes: Vec::new() };
+        let ring = kernel::revolve(&plane, &[region], Vec2::new(0.0, 0.0), Vec2::new(0.0, 1.0), std::f64::consts::TAU)?
+            .pop()
+            .ok_or_else(|| DocError::Invalid("the relief groove".into()))?;
+        let faces = ring.face_count();
+        let cut = kernel::boolean(&nb.body, &ring, BoolOp::Cut)?.ok_or_else(|| DocError::Invalid("the relief groove removed everything".into()))?;
+        let unnamed = crate::lineage::Lineage::unnamed_faces(faces);
+        let lineage = nb.lineage.and_then(|l| crate::lineage::Lineage::step(&cut, &[&l, &unnamed]));
+        nb = Traced { body: cut, lineage, recipe: None };
+    }
     let nb = if continuous_flanks { nb } else { chamfer(nb)? };
     if let Some(slot) = st.bodies.get_mut(i) {
         *slot = mb.remade(nb);
@@ -1010,15 +1305,12 @@ fn tip_cones(
     t: &ThreadInfo,
     radius: f64,
     ends: [End; 2],
-    (tip, from): (ThreadTip, usize),
+    (tip, from, picked): (ThreadTip, usize, bool),
     angle: Option<f64>,
     depth: Option<f64>,
     taper: Option<(f64, usize)>,
 ) -> Result<Vec<Body>> {
-    if t.internal {
-        return Err(DocError::Invalid("a chamfered tip is for an external thread (ISO 4753); countersink the hole's entry instead".into()));
-    }
-    let g = t.form.groove(t.major_diameter, t.pitch, false);
+    let g = t.form.groove(t.major_diameter, t.pitch, t.internal);
     let a = angle.unwrap_or(std::f64::consts::FRAC_PI_4);
     if !(a > 1f64.to_radians() && a < 89f64.to_radians()) {
         return Err(DocError::Invalid("the chamfer's angle to the axis must be between 1° and 89°".into()));
@@ -1029,6 +1321,9 @@ fn tip_cones(
         Some((d0, _)) => d0 + (t.end - t.start) / 16.0,
         None => t.major_diameter,
     };
+    if t.internal {
+        return entry_chamfers(t, radius, ends, (tip, from, picked), a, depth, major);
+    }
     let depth = match (depth, t.form) {
         (Some(d), _) => d,
         // ISO 724: d3 = d1 - H/6 = d - 2 (17/24) H.
@@ -1054,6 +1349,7 @@ fn tip_cones(
     let e = 0.5 * t.pitch;
     let mut out = Vec::new();
     let free = |side: usize| ends.get(side) == Some(&End::Free);
+    let from = start_end(ends, from, picked);
     if tip == ThreadTip::Start && !free(from) {
         return Err(DocError::Invalid("the end the thread starts from is not a free end (material goes on past it, or the thread stops inside the face): chamfer it with `tip: both`, or start the thread from its free end".into()));
     }
@@ -1072,6 +1368,75 @@ fn tip_cones(
     }
     if out.is_empty() {
         return Err(DocError::Invalid("a chamfered tip needs a free end of the thread (one with no material past it)".into()));
+    }
+    Ok(out)
+}
+
+/// The end a chamfered start goes on: the one the thread starts from, or, where no end was picked
+/// and that end is closed (a thread over the whole face, started by default from its shoulder or
+/// a hole's bottom), the face's other end when that one is free. A picked end is kept.
+fn start_end(ends: [End; 2], from: usize, picked: bool) -> usize {
+    let free = |side: usize| ends.get(side) == Some(&End::Free);
+    let other = 1 - from.min(1);
+    if !picked && !free(from) && free(other) && ends.get(from) != Some(&End::Inside) { other } else { from }
+}
+
+/// The entry chamfer of an internal thread at its free ends (`tip` as for an external one), the
+/// thread's lead-in, not a screw head's countersink: the material inside a cone `a` to the axis
+/// (default 45°, 90° included) that reaches the
+/// diameter 2 (r_crest + `depth`) at the hole's mouth, cut after the groove so the first teeth run
+/// into it. `depth` is radial from the thread's crest (the minor diameter) outward; by default
+/// the cone reaches 0.1 P past the major diameter at the mouth, so no knife-edge first tooth is
+/// left. A taper thread's crest and major follow its taper at each end.
+fn entry_chamfers(
+    t: &ThreadInfo,
+    radius: f64,
+    ends: [End; 2],
+    (tip, from, picked): (ThreadTip, usize, bool),
+    a: f64,
+    depth: Option<f64>,
+    major: impl Fn(usize) -> f64,
+) -> Result<Vec<Body>> {
+    let g = t.form.groove(t.major_diameter, t.pitch, true);
+    let k = *t.axis;
+    let u = k.cross(if k.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) });
+    let u = u.normalized().ok_or_else(|| DocError::Invalid("thread axis".into()))?;
+    let slope = a.tan();
+    let e = 0.5 * t.pitch;
+    let free = |side: usize| ends.get(side) == Some(&End::Free);
+    let from = start_end(ends, from, picked);
+    if tip == ThreadTip::Start && !free(from) {
+        return Err(DocError::Invalid(
+            "the end the thread starts from is not the hole's mouth (material goes on past it, or the thread stops inside the face): chamfer it with `tip: both`, or start the thread from the mouth".into(),
+        ));
+    }
+    // How far the crest lies inside the major radius, the same at either end of a taper.
+    let tooth = t.major_diameter / 2.0 - g.crest_r;
+    let mut out = Vec::new();
+    for (side, at, out_dir) in [(0usize, t.start, -k), (1, t.end, k)] {
+        if !free(side) || (tip == ThreadTip::Start && side != from) {
+            continue;
+        }
+        let crest = major(side) / 2.0 - tooth;
+        let r_f = match depth {
+            Some(d) if d.is_finite() && d > 0.0 => crest + d,
+            Some(_) => return Err(DocError::Invalid("the entry chamfer's depth must be a length past the thread's minor diameter".into())),
+            None => major(side) / 2.0 + 0.1 * t.pitch,
+        };
+        // From inside the bore (in the air, past the narrowed wall too) out to the cone.
+        let r_in = crest.min(radius) - 0.1 * t.pitch;
+        if !(r_in > 0.0 && r_f > r_in && r_f.is_finite()) {
+            return Err(DocError::Invalid("the entry chamfer doesn't fit this hole".into()));
+        }
+        // In the plane: x radial, y outward along the axis from the mouth.
+        let plane = Plane { origin: t.axis_point + k * at, x: u, y: out_dir };
+        let pts = [Vec2::new(r_in, e), Vec2::new(r_f, e), Vec2::new(r_f, 0.0), Vec2::new(r_in, -(r_f - r_in) / slope)];
+        let region = Region2 { outer: solidcore_record::Loop2::polygon(&pts), holes: Vec::new() };
+        let mut ring = kernel::revolve(&plane, &[region], Vec2::new(0.0, 0.0), Vec2::new(0.0, 1.0), std::f64::consts::TAU)?;
+        out.push(ring.pop().ok_or_else(|| DocError::Invalid("entry chamfer".into()))?);
+    }
+    if out.is_empty() {
+        return Err(DocError::Invalid("an entry chamfer needs the hole's mouth: a free end of the thread, with no material past it".into()));
     }
     Ok(out)
 }
@@ -1101,6 +1466,9 @@ mod tests {
             ease_out: (0.0, 0.0),
             tapped: false,
             old_auto_size: false,
+            clearance: 0.0,
+            relief: None,
+            design_root: false,
         }
     }
 
