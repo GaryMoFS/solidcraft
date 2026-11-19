@@ -5125,3 +5125,36 @@ fn three_point_plane_dialog_takes_points_on_a_mesh_body() {
     }
     assert_eq!(solidcraft_engine::view::construction_planes(&h.app.session).len(), 1);
 }
+
+/// The Thread dialog's End offers a relief groove: picked there, the command asks for one, and
+/// the saved thread reopens with it.
+#[test]
+fn a_thread_end_can_be_a_relief_groove() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.home.open = false;
+    h.app.run("solid.cylinder", json!({"radius":8,"height":10})).unwrap();
+    h.app.run("solid.cylinder", json!({"base":[0,0,10],"radius":5,"height":25,"operation":"join","targets":["Body1"]})).unwrap();
+    let id = h.app.run("solid.thread", json!({"face":[5,0,25],"designation":"M10","modeled":true})).unwrap()["feature"].as_u64().unwrap();
+    h.frames(4);
+    h.step(&json!({"click":{"handle":"timeline:Thread1"},"double":true})).unwrap();
+    h.frames(4);
+    for handle in ["dialog:End", "dialog:End:thread.end_relief"] {
+        h.step(&json!({"click":{"handle":handle}})).unwrap();
+    }
+    h.frames(2);
+    let params = |h: &crate::scenario::Harness| {
+        let (_, p) = crate::dialogs::apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().remove(0);
+        if p.get("params").is_some() { p["params"].clone() } else { p }
+    };
+    let p = params(&h);
+    assert_eq!((&p["relief"], p.get("ease_out")), (&json!(true), None), "{p}");
+    let (cmd, full) = crate::dialogs::apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap().remove(0);
+    h.app.dialog = None;
+    h.app.run(&cmd, full).unwrap();
+    assert!(matches!(h.app.session.doc.feature(id).unwrap().kind, solidcraft_engine::doc::FeatureKind::Thread { relief: Some(_), .. }));
+    let result = h.app.session.model.result(id).unwrap();
+    assert!(result.error.is_none(), "{result:?}");
+    h.app.edit_feature(id);
+    h.frames(2);
+    assert_eq!(params(&h)["relief"], json!(true), "the relief comes back when the thread is edited");
+}
