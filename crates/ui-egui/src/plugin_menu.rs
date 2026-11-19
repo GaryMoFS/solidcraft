@@ -175,6 +175,10 @@ pub(crate) fn form(schema: &Value) -> Option<Vec<(Field, Input)>> {
         None => Vec::new(),
         Some(list) => list.as_array()?.iter().map(Value::as_str).collect::<Option<_>>()?,
     };
+    let order: Vec<&str> = match schema.get("x-solidcraft-order") {
+        None => Vec::new(),
+        Some(list) => list.as_array()?.iter().map(Value::as_str).collect::<Option<_>>()?,
+    };
     let properties = match schema.get("properties") {
         // A required key that no field can fill: the dialog could only send it empty.
         None if !required.is_empty() => return None,
@@ -185,10 +189,11 @@ pub(crate) fn form(schema: &Value) -> Option<Vec<(Field, Input)>> {
         return None;
     }
     let mut fields = properties.iter().map(|(key, property)| field(key, property, required.contains(&key.as_str()))).collect::<Option<Vec<_>>>()?;
-    // A JSON object has no order: the required fields come first in the order `required` names
-    // them, then the rest by name.
-    let rank = |key: &str| required.iter().position(|r| *r == key).unwrap_or(usize::MAX);
-    fields.sort_by(|(a, _), (b, _)| rank(&a.key).cmp(&rank(&b.key)).then_with(|| a.key.cmp(&b.key)));
+    // A JSON object has no order: honor x-solidcraft-order first, then required fields in order,
+    // then the rest by name.
+    let order_rank = |key: &str| order.iter().position(|o| *o == key).unwrap_or(usize::MAX);
+    let req_rank = |key: &str| required.iter().position(|r| *r == key).unwrap_or(usize::MAX);
+    fields.sort_by(|(a, _), (b, _)| order_rank(&a.key).cmp(&order_rank(&b.key)).then_with(|| req_rank(&a.key).cmp(&req_rank(&b.key))).then_with(|| a.key.cmp(&b.key)));
     Some(fields)
 }
 
