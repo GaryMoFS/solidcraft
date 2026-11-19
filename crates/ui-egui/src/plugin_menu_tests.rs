@@ -289,32 +289,69 @@ fn the_menu_lists_install_then_entries_with_a_submenu_for_several() {
     assert_eq!(labels, ["measure…", "tidy…"]);
 }
 
-/// Each plugin is its own thing: every command gets its own menu row (several under the plugin's
-/// name) and its own ribbon button, and a plugin turned off in Preferences shows in neither.
+/// Each plugin gets its own menu row or submenu, and one button on the Plugins tab (with a split
+/// dropdown when it has several commands), and a plugin turned off in Preferences shows in neither.
 #[test]
 fn each_plugin_command_has_its_own_menu_row_and_ribbon_button_and_a_disabled_plugin_is_hidden() {
     use crate::app_bar::FileRow;
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
     app.plugin_menu.listed = vec![
-        listed("gears", vec![entry("spur", "edit", json!([]))]),
-        listed("tools", vec![entry("measure", "read", json!([])), entry("tidy", "edit", json!([{"kind":"ribbon","name":"Tidy up"}]))]),
+        listed("gears", vec![entry("spur", "edit", json!([{"kind":"menu","name":"Plugins"}]))]),
+        listed(
+            "tools",
+            vec![
+                entry("measure", "read", json!([])),
+                entry("tidy", "edit", json!([{"kind":"ribbon","name":"Tidy up"}])),
+            ],
+        ),
+        listed(
+            "helix",
+            vec![
+                entry("create-helix", "edit", json!([{"kind":"menu","name":"Create Helix..."},{"kind":"ribbon","name":"Helix"}])),
+                entry(
+                    "create-variable-helix",
+                    "edit",
+                    json!([{"kind":"menu","name":"Create Variable Helix..."},{"kind":"ribbon","name":"Variable Helix"}]),
+                ),
+            ],
+        ),
     ];
     let buttons = ribbon_buttons(&app);
     let ids: Vec<&str> = buttons.iter().map(|b| b.id.as_str()).collect();
-    assert_eq!(ids, ["plugin_entry:gears:spur", "plugin_entry:tools:measure", "plugin_entry:tools:tidy"]);
+    assert_eq!(ids, ["plugin_entry:gears:spur", "plugin_entry:tools:measure", "plugin_entry:helix:create-helix"]);
     let labels: Vec<&str> = buttons.iter().map(|b| b.label.as_str()).collect();
-    assert_eq!(labels, ["gears plugin", "measure", "Tidy up"], "one command: the plugin's name; a ribbon slot names its button");
+    assert_eq!(labels, ["gears plugin", "tools plugin", "Helix"], "host menu slots do not rename the button; first ribbon label names split buttons");
+    assert_eq!(buttons[0].entries.len(), 1);
+    assert_eq!(
+        buttons[1].entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["plugin_entry:tools:measure", "plugin_entry:tools:tidy"]
+    );
+    assert_eq!(buttons[1].split_name, "tools plugin");
+    assert_eq!(
+        buttons[2].entries.iter().map(|e| (e.id.as_str(), e.label.as_str())).collect::<Vec<_>>(),
+        [
+            ("plugin_entry:helix:create-helix", "Create Helix..."),
+            ("plugin_entry:helix:create-variable-helix", "Create Variable Helix..."),
+        ]
+    );
     assert!(buttons.iter().all(|b| b.icon == "prefs_plugins"), "no manifest icon yet: the generic plugin icon");
     assert!(app.plugin_menu.dialogs.is_empty(), "listing opens nothing");
 
     let menu = rows(&app);
     assert!(matches!(&menu[3], FileRow::Item(i) if i.id == "entry:0:0" && i.label == "gears plugin…"));
     assert!(matches!(&menu[4], FileRow::Sub { label, rows } if label == "tools plugin" && rows.len() == 2));
+    assert!(matches!(&menu[5], FileRow::Sub { label, rows } if label == "helix plugin" && rows.len() == 2));
 
-    // The ribbon button opens that one command's dialog, titled by it alone.
+    // Ribbon clicks can open either primary or secondary entries by id.
     assert!(choose_ribbon(&mut app, "plugin_entry:tools:tidy"));
     let dialog = app.plugin_menu.dialogs.pop().expect("its dialog");
     assert_eq!((dialog.plugin.id.as_str(), dialog.entry.as_str(), dialog.label.as_str()), ("tools", "tidy", "tidy"));
+    assert!(choose_ribbon(&mut app, "plugin_entry:helix:create-variable-helix"));
+    let dialog = app.plugin_menu.dialogs.pop().expect("its dialog");
+    assert_eq!(
+        (dialog.plugin.id.as_str(), dialog.entry.as_str(), dialog.label.as_str()),
+        ("helix", "create-variable-helix", "Create Variable Helix...")
+    );
     assert!(!choose_ribbon(&mut app, "sketch.line"), "a command's id is not a plugin's");
 
     // The ribbon group's label opens the same menu below it (a narrow ribbon trims buttons).
@@ -328,15 +365,17 @@ fn each_plugin_command_has_its_own_menu_row_and_ribbon_button_and_a_disabled_plu
 
     app.preferences.disabled_plugins.insert("gears".into());
     let ids: Vec<String> = ribbon_buttons(&app).into_iter().map(|b| b.id).collect();
-    assert_eq!(ids, ["plugin_entry:tools:measure", "plugin_entry:tools:tidy"], "off: no ribbon button");
+    assert_eq!(ids, ["plugin_entry:tools:measure", "plugin_entry:helix:create-helix"], "off: no ribbon button");
     let menu = rows(&app);
-    assert_eq!(menu.len(), 4, "off: no menu row");
+    assert_eq!(menu.len(), 5, "off: no menu row");
     assert!(matches!(&menu[3], FileRow::Sub { label, .. } if label == "tools plugin"));
+    assert!(matches!(&menu[4], FileRow::Sub { label, .. } if label == "helix plugin"));
     choose_ribbon(&mut app, "plugin_entry:gears:spur");
     choose(&mut app, "entry:0:0");
     assert!(app.plugin_menu.dialogs.is_empty(), "a plugin turned off opens nothing");
 
     app.preferences.disabled_plugins.insert("tools".into());
+    app.preferences.disabled_plugins.insert("helix".into());
     assert!(ribbon_buttons(&app).is_empty());
     assert!(matches!(&rows(&app)[3], FileRow::Item(i) if i.label == app.tr("ui.plugin_menu_all_off") && !i.enabled));
 }
@@ -780,6 +819,7 @@ mod native {
     fn the_plugins_menu_opens_from_the_ribbon_group_and_its_entry_opens_the_dialog() {
         let root = package("menu");
         let mut h = crate::scenario::Harness::new();
+        h.app.session.plugin_state.plugins_dir = Some(h.dir.join("plugins"));
         h.app.session.plugin_state.packages.insert("boxes".into(), root.join("boxes").to_string_lossy().into_owned());
         h.frames(2);
         // The ribbon's Plugins group label opens the menu below it.
@@ -935,6 +975,95 @@ mod native {
         assert!(!error.is_empty(), "{error}");
         assert_eq!(h.app.session.doc.features.len(), 2, "the failed run changes nothing");
         assert!(same_camera(&h.app.cam, &stayed), "a failed run does not move the camera: {:?} vs {stayed:?}", h.app.cam);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugins_tab_replaces_model_buttons_and_groups_multi_entry_plugins_into_split_dropdowns() {
+        let root = std::env::temp_dir().join(format!("solidcraft-plugin-tab-{}", std::process::id()));
+        let (name, version) = solidcraft_engine::plugin::API.rsplit_once('@').unwrap();
+        let wasm = wat::parse_str(
+            &include_str!("plugin_menu_fixture.wat").replace("PLUGIN_PACKAGE", name).replace("PLUGIN_VERSION", version),
+        )
+        .unwrap();
+
+        let gears = root.join("gears");
+        std::fs::create_dir_all(&gears).unwrap();
+        std::fs::write(gears.join("plugin.wasm"), &wasm).unwrap();
+        std::fs::write(
+            gears.join("plugin.json"),
+            json!({
+                "id": "gears",
+                "name": "Gears",
+                "version": "0.1.0",
+                "capabilities": ["commands@0.1"],
+                "runtime": {
+                    "module": "plugin.wasm",
+                    "entries": [{"name": "make-gear", "effect": "edit", "slots": [{"kind": "menu", "name": "Plugins"}]}],
+                    "commands": ["solid.box"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let helix = root.join("helix");
+        std::fs::create_dir_all(&helix).unwrap();
+        std::fs::write(helix.join("plugin.wasm"), &wasm).unwrap();
+        std::fs::write(
+            helix.join("plugin.json"),
+            json!({
+                "id": "helix",
+                "name": "Helical Sketch Generator",
+                "version": "0.2.0",
+                "capabilities": ["commands@0.1"],
+                "runtime": {
+                    "module": "plugin.wasm",
+                    "entries": [
+                        {"name": "create-helix", "effect": "edit", "slots": [{"kind": "menu", "name": "Create Helix..."}, {"kind": "ribbon", "name": "Helix"}]},
+                        {"name": "create-variable-helix", "effect": "edit", "slots": [{"kind": "menu", "name": "Create Variable Helix..."}, {"kind": "ribbon", "name": "Variable Helix"}]}
+                    ],
+                    "commands": ["solid.box"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.preferences.ribbon_tabs_only = false;
+        h.app.session.plugin_state.plugins_dir = Some(root.clone());
+        h.frames(2);
+
+        // Model tab has no plugin buttons.
+        assert_eq!(h.app.ui.tab, "MODEL");
+        assert!(crate::scenario::handle_at("button:plugin_entry:gears:make-gear").is_none());
+        assert!(crate::scenario::handle_at("button:plugin_entry:helix:create-helix").is_none());
+        assert!(crate::scenario::handle_at("tab:PLUGINS").is_some());
+
+        // Switching to the Plugins tab shows one button per plugin, and multi-entry plugins have a split dropdown.
+        h.step(&json!({"click": {"handle": "tab:PLUGINS"}})).unwrap();
+        h.frames(2);
+        assert_eq!(h.app.ui.tab, "PLUGINS");
+        assert!(crate::scenario::handle_at("button:plugin_entry:gears:make-gear").is_some());
+        assert!(crate::scenario::handle_at("button:plugin_entry:helix:create-helix").is_some());
+        assert!(crate::scenario::handle_at("button:plugin_entry:helix:create-variable-helix").is_none(), "grouped inside the split dropdown");
+        assert!(crate::scenario::handle_at("family:helix").is_some());
+        assert!(crate::scenario::handle_at("family:gears").is_none(), "single-entry plugin has no split dropdown");
+
+        h.step(&json!({"click": {"handle": "family:helix"}})).unwrap();
+        h.frames(2);
+        assert!(crate::scenario::handle_at("menu:plugin_entry:helix:create-helix").is_some());
+        assert!(crate::scenario::handle_at("menu:plugin_entry:helix:create-variable-helix").is_some());
+
+        h.step(&json!({"click": {"handle": "menu:plugin_entry:helix:create-variable-helix"}})).unwrap();
+        h.frames(2);
+        let dialog = h.app.plugin_menu.dialog().expect("split dropdown opens selected entry dialog");
+        assert_eq!(dialog.plugin.id, "helix");
+        assert_eq!(dialog.entry, "create-variable-helix");
+        assert_eq!(dialog.label, "Create Variable Helix...");
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

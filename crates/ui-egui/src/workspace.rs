@@ -79,6 +79,7 @@ pub const TAB_ACCENTS: TabTable = TabTable::new(&[
     tab_style("FORM", AccentRamp::Form, Some("form")),
     tab_style("SHEET METAL", AccentRamp::Sheet, None),
     tab_style("WELDMENTS", AccentRamp::Main, None),
+    tab_style("PLUGINS", AccentRamp::Main, None),
     tab_style("ASSEMBLE", AccentRamp::Main, None),
     tab_style("INSERT", AccentRamp::Main, None),
     tab_style("INSPECT", AccentRamp::Main, None),
@@ -892,8 +893,11 @@ pub struct SpecialtyTab {
     pub icon: &'static str,
 }
 
-pub const SPECIALTY_TABS: &[SpecialtyTab] =
-    &[SpecialtyTab { tab: "SHEET METAL", icon: "sheet" }, SpecialtyTab { tab: "WELDMENTS", icon: "frame_member" }];
+pub const SPECIALTY_TABS: &[SpecialtyTab] = &[
+    SpecialtyTab { tab: "SHEET METAL", icon: "sheet" },
+    SpecialtyTab { tab: "WELDMENTS", icon: "frame_member" },
+    SpecialtyTab { tab: "PLUGINS", icon: "prefs_plugins" },
+];
 
 /// A tab's row in the toolbar menu: the icon of the command that leads the tab (Model › Create ›
 /// Extrude, Inspect › Measure, View › Views and so on).
@@ -1126,7 +1130,7 @@ mod tests {
         type Slots = fn(&Tokens) -> [egui::Color32; 3];
         let main: Slots = |t| [t.accent, t.selected_ink, t.accent_soft];
         let render: Slots = |t| [t.render_fill, t.render_ink, t.render_soft];
-        let tabs: [(&str, Slots, Option<&str>); 16] = [
+        let tabs: [(&str, Slots, Option<&str>); 17] = [
             ("MODEL", main, None),
             ("SKETCH", |t| [t.sketch_accent, t.sketch_ink, t.sketch_soft], Some("sketch")),
             ("SURFACE", |t| [t.surface_fill, t.surface_ink, t.surface_soft], Some("surface")),
@@ -1134,6 +1138,7 @@ mod tests {
             ("FORM", |t| [t.form_fill, t.form_tab_ink, t.form_soft], Some("form")),
             ("SHEET METAL", |t| [t.sheet_fill, t.sheet_ink, t.sheet_soft], None),
             ("WELDMENTS", main, None),
+            ("PLUGINS", main, None),
             ("ASSEMBLE", main, None),
             ("INSERT", main, None),
             ("INSPECT", main, None),
@@ -1424,8 +1429,8 @@ mod tests {
     fn contextual_tabs_follow_the_active_body_and_allow_other_tabs() {
         let mut h = crate::scenario::Harness::new();
         let mut fresh = TABS.to_vec();
-        fresh.extend(["SHEET METAL", "WELDMENTS"]);
-        assert_eq!(visible_tabs(&h.app), fresh, "SHEET METAL and WELDMENTS are reachable before any sheet body or member exists");
+        fresh.extend(["SHEET METAL", "WELDMENTS", "PLUGINS"]);
+        assert_eq!(visible_tabs(&h.app), fresh, "SHEET METAL, WELDMENTS and PLUGINS are reachable before any sheet body or member exists");
         h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
         assert_eq!(h.app.ui.tab, "SKETCH");
         h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[40,30]})).unwrap();
@@ -1575,7 +1580,7 @@ mod tests {
         let rows: Vec<_> = crate::toolbar_custom::toolbar_items(&h.app).into_iter().filter(|i| i.id == "ui.toolbarTab").collect();
         assert_eq!(
             rows.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
-            ["Model", "Surface", "Assemble", "Insert", "Inspect", "Manage", "View", "Sheet Metal", "Weldments"]
+            ["Model", "Surface", "Assemble", "Insert", "Inspect", "Manage", "View", "Sheet Metal", "Weldments", "Plugins"]
         );
         assert!(rows.iter().all(|i| i.shortcut == "current"), "all existing tabs stay on by default");
         h.step(&json!({"click":{"handle":"ribbon:add_tab"}})).unwrap();
