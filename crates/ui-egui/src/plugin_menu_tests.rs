@@ -3055,3 +3055,79 @@ mod native {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+#[test]
+fn x_solidcraft_order_orders_fields_and_rejects_non_string_list() {
+    let schema = json!({
+        "type": "object",
+        "required": ["edges"],
+        "x-solidcraft-order": ["edges", "path_mode", "profile", "offset_x"],
+        "properties": {
+            "offset_x": { "type": "number", "default": 0.0 },
+            "path_mode": { "type": "string", "oneOf": [{"const": "open", "title": "Open"}, {"const": "closed", "title": "Closed"}], "default": "open" },
+            "edges": { "type": "array", "minItems": 1, "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["edge"]} },
+            "profile": { "type": "array", "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["profile"]} },
+            "zeta": { "type": "string", "default": "" },
+            "alpha": { "type": "boolean", "default": true }
+        }
+    });
+    let fields = form(&schema).expect("valid schema with x-solidcraft-order");
+    let keys: Vec<&str> = fields.iter().map(|(f, _)| f.key.as_str()).collect();
+    assert_eq!(keys, ["edges", "path_mode", "profile", "offset_x", "alpha", "zeta"]);
+
+    let bad = json!({
+        "type": "object",
+        "x-solidcraft-order": ["edges", 42],
+        "properties": {
+            "edges": { "type": "array", "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["edge"]} }
+        }
+    });
+    assert_eq!(form(&bad), None);
+}
+
+#[test]
+fn edge_path_sweep_schema_parses_runs_with_edges_only_and_accepts_browser_sketch_pick() {
+    let mut h = box_and_pick_plugin();
+    let prof_sk = h.app.run("sketch.create", json!({"plane": "XY", "name": "ProfileSketch"})).unwrap();
+    let prof_id = prof_sk["sketch"].as_u64().unwrap();
+    h.app.run("sketch.rectangle.center", json!({"center": [0.0, 0.0], "corner": [2.0, 1.0]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.app.run("select.clear", json!({})).unwrap();
+
+    let mut unified = entry("edge-path-sweep", "edit", json!([{"kind": "menu", "name": "Edge Path & Sweep..."}, {"kind": "ribbon", "name": "Edge Path"}]));
+    unified.input_schema = json!({
+        "type": "object",
+        "required": ["edges"],
+        "x-solidcraft-order": ["edges", "path_mode", "profile", "profile_shape", "sweep_operation"],
+        "properties": {
+            "edges": { "type": "array", "title": "Edges", "minItems": 1, "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["edge"]} },
+            "path_mode": { "type": "string", "title": "Path Mode", "oneOf": [{"const": "open", "title": "Open"}, {"const": "closed", "title": "Closed Loop"}], "default": "open" },
+            "profile": { "type": "array", "title": "Sweep Profile (optional)", "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["profile"]} },
+            "profile_shape": { "type": "string", "title": "Built-in Profile", "oneOf": [{"const": "none", "title": "None"}, {"const": "circle", "title": "Circle"}], "default": "none" },
+            "sweep_operation": { "type": "string", "title": "Sweep Operation", "oneOf": [{"const": "new_body", "title": "New Body"}, {"const": "join", "title": "Join"}], "default": "new_body" }
+        }
+    });
+    h.app.plugin_menu.listed = vec![listed("edge-path-sweep", vec![unified])];
+    h.app.plugin_menu.loaded = true;
+
+    open_entry(&mut h.app, 0, 0);
+    h.frames(2);
+    let keys: Vec<&str> = h.app.plugin_menu.dialog().unwrap().fields.as_ref().unwrap().iter().map(|(f, _)| f.key.as_str()).collect();
+    assert_eq!(keys, ["edges", "path_mode", "profile", "profile_shape", "sweep_operation"]);
+
+    // Pick an edge in the viewport into `edges` (field 0). Path-only is ready immediately.
+    h.step(&json!({"click": {"world": [10, 0, 0]}})).unwrap();
+    h.frames(2);
+    let sent_path_only = h.app.plugin_menu.dialog().unwrap().ready(&h.app).expect("edges alone are sufficient for path-only");
+    assert_eq!(sent_path_only["edges"].as_array().map(Vec::len), Some(1));
+    assert!(sent_path_only.get("profile").is_none());
+
+    // Activate `profile` field (index 1) and click the sketch in the Browser (`pick_sketch_into_dialog`).
+    h.step(&json!({"click": {"handle": "plugin_dialog:field:profile"}})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.dialog.as_ref().map(|d| d.active), Some(1));
+    assert!(crate::browser::pick_sketch_into_dialog(&mut h.app, prof_id));
+    h.frames(2);
+    let sent_sweep = h.app.plugin_menu.dialog().unwrap().ready(&h.app).expect("edges + profile ready");
+    assert_eq!(sent_sweep["profile"], json!([{"type": "profile", "sketch": prof_id, "index": 0}]));
+}
