@@ -6942,7 +6942,8 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             if !designation.trim().is_empty() && suggested.as_deref() != Some(designation.as_str()) {
                 common["designation"] = json!(designation.trim());
             }
-            crate::dialogs_thread::put_params(&mut common, length, options, &d.inputs);
+            let modeled = d.extra.get("modeled").and_then(Value::as_bool).unwrap_or(false);
+            crate::dialogs_thread::put_params(&mut common, length, options, &d.inputs, modeled);
             let mut seen = std::collections::BTreeSet::new();
             let mut faces = Vec::new();
             for pick in sels(d, 0) {
