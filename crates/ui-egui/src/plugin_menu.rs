@@ -3,9 +3,10 @@
 //! The menu sits after File in the application bar (desktop builds only; the web build runs no
 //! plugins). "Install plugin…" comes first, then one row per command of each installed plugin
 //! that is turned on in Preferences › Plugins, labelled by [`command_title`]. A plugin with more
-//! than one command gets a submenu named after the plugin. The Model tab of the ribbon has a
-//! Plugins group with one button per command ([`ribbon_buttons`]). A plugin turned off shows in
-//! neither place, and nothing opens or runs until the user picks one specific command.
+//! than one command gets a submenu named after the plugin. The Plugins tab of the ribbon has a
+//! Plugins group with one button per plugin ([`ribbon_buttons`], with a split dropdown when it
+//! has several commands). A plugin turned off shows in neither place, and nothing opens or runs
+//! until the user picks one specific command.
 //!
 //! Choosing an entry opens a dialog built from its `input_schema`: a number field, a whole number
 //! field, a checkbox, a dropdown, a text field or a selection field per property. A selection
@@ -725,11 +726,23 @@ pub(crate) fn command_icon<'a>(plugin: &'a Listed, entry: &solidcraft_engine::pl
         .map_or(crate::plugin_images::GENERIC, String::as_str)
 }
 
+fn host_menu_name(name: &str) -> bool {
+    matches!(name.trim().to_ascii_lowercase().as_str(), "plugins" | "file" | "help")
+}
+
+fn host_tab_name(name: &str) -> bool {
+    crate::workspace::choosable_tabs().chain(["SKETCH"]).any(|tab| tab.eq_ignore_ascii_case(name.trim()))
+}
+
+fn ribbon_slot_label(entry: &solidcraft_engine::plugin::Entry) -> Option<String> {
+    slot_name(entry, "ribbon").filter(|name| !host_tab_name(name))
+}
+
 /// A plugin command's title, in the menu, on its ribbon button and on its dialog: the entry's
-/// `menu` slot name when it declares one, else the plugin's name when the plugin has this one
-/// command, else the entry's own name.
+/// `menu` slot name when it declares a display title, else the plugin's name when the plugin has
+/// this one command, else the entry's own name.
 pub(crate) fn command_title(plugin: &Listed, entry: &solidcraft_engine::plugin::Entry) -> String {
-    match slot_name(entry, "menu") {
+    match slot_name(entry, "menu").filter(|name| !host_menu_name(name)) {
         Some(name) => name,
         None if plugin.entries.len() == 1 => plugin.name.clone(),
         None => entry.name.clone(),
@@ -752,37 +765,72 @@ pub(crate) fn shown(app: &SolveApp, plugin: &Listed) -> bool {
     crate::plugins::enabled(app, &plugin.id)
 }
 
-/// One plugin command's button in the ribbon's Plugins group.
+/// One entry inside a plugin's ribbon button (or its split dropdown when a plugin has several).
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct RibbonButton {
+pub(crate) struct RibbonEntry {
     /// `plugin_entry:<plugin id>:<entry name>`.
     pub(crate) id: String,
-    /// The label under the button: the entry's `ribbon` slot name, else its [`command_title`].
     pub(crate) label: String,
-    /// Its accessible name and hover text: the plugin's name, and the command's when it differs.
     pub(crate) name: String,
-    /// The command's icon ([`command_icon`]).
     pub(crate) icon: String,
 }
 
-/// The ribbon's Plugins group: one button per command of each plugin that is turned on, in the
-/// menu's order. Empty on the web build, which runs no plugins.
+/// One plugin's button in the Plugins tab's Plugins group.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RibbonButton {
+    /// `plugin_entry:<plugin id>:<entry name>` of the plugin's primary entry.
+    pub(crate) id: String,
+    pub(crate) plugin_id: String,
+    /// The label under the button (or on its split menu row).
+    pub(crate) label: String,
+    /// Its accessible name and hover text: the plugin's name, and the command's when it differs.
+    pub(crate) name: String,
+    /// The plugin's name, shown on its split dropdown heading and accessible label.
+    pub(crate) split_name: String,
+    /// The primary command's icon ([`command_icon`]).
+    pub(crate) icon: String,
+    /// Every command of the plugin in manifest order; more than one opens a split dropdown.
+    pub(crate) entries: Vec<RibbonEntry>,
+}
+
+/// The Plugins tab's Plugins group: one button per plugin that is turned on (split dropdown when
+/// it has several commands), in the menu's order. Empty on the web build, which runs no plugins.
 pub(crate) fn ribbon_buttons(app: &SolveApp) -> Vec<RibbonButton> {
     if cfg!(target_arch = "wasm32") {
         return Vec::new();
     }
     let mut buttons = Vec::new();
-    for plugin in app.plugin_menu.listed.iter().filter(|p| shown(app, p)) {
-        for entry in &plugin.entries {
-            let title = command_title(plugin, entry);
-            let name = if title == plugin.name { title.clone() } else { format!("{}: {title}", plugin.name) };
-            buttons.push(RibbonButton {
-                id: format!("{RIBBON_PREFIX}{}:{}", plugin.id, entry.name),
-                label: slot_name(entry, "ribbon").unwrap_or(title),
-                name,
-                icon: command_icon(plugin, entry).to_owned(),
-            });
-        }
+    for plugin in app.plugin_menu.listed.iter().filter(|p| shown(app, p) && !p.entries.is_empty()) {
+        let entries: Vec<RibbonEntry> = plugin
+            .entries
+            .iter()
+            .map(|entry| {
+                let title = command_title(plugin, entry);
+                let name = if title == plugin.name { title.clone() } else { format!("{}: {title}", plugin.name) };
+                RibbonEntry {
+                    id: format!("{RIBBON_PREFIX}{}:{}", plugin.id, entry.name),
+                    label: title,
+                    name,
+                    icon: command_icon(plugin, entry).to_owned(),
+                }
+            })
+            .collect();
+        let first = &plugin.entries[0];
+        let first_entry = &entries[0];
+        let label = if plugin.entries.len() == 1 {
+            ribbon_slot_label(first).unwrap_or_else(|| first_entry.label.clone())
+        } else {
+            ribbon_slot_label(first).unwrap_or_else(|| plugin.name.clone())
+        };
+        buttons.push(RibbonButton {
+            id: first_entry.id.clone(),
+            plugin_id: plugin.id.clone(),
+            label,
+            name: first_entry.name.clone(),
+            split_name: plugin.name.clone(),
+            icon: first_entry.icon.clone(),
+            entries,
+        });
     }
     buttons
 }

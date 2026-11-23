@@ -54,11 +54,14 @@ impl State {
         self.discovery.is_some()
     }
 }
-/// The ribbon tab a manifest's `ribbon` slot names, when it is one besides Model. Model's Plugins
-/// group already holds every plugin command (and labels it with the slot's name), so a slot that
-/// names Model or no tab is not drawn a second time.
+/// The ribbon tab a manifest's `ribbon` slot names, when it is one besides Model or Plugins.
+/// The Plugins tab's Plugins group already holds every plugin, so a slot that names Model,
+/// Plugins or no tab is not drawn a second time.
 pub(crate) fn ribbon_name(name: &str) -> Option<&'static str> {
-    crate::workspace::choosable_tabs().chain(["SKETCH"]).find(|tab| tab.eq_ignore_ascii_case(name.trim())).filter(|tab| *tab != "MODEL")
+    crate::workspace::choosable_tabs()
+        .chain(["SKETCH"])
+        .find(|tab| tab.eq_ignore_ascii_case(name.trim()))
+        .filter(|tab| !matches!(*tab, "MODEL" | "PLUGINS"))
 }
 pub(crate) fn menu_name(name: &str) -> Option<&'static str> {
     match name.trim().to_ascii_lowercase().as_str() {
@@ -107,7 +110,7 @@ pub(crate) fn invalidate(app: &mut SolveApp) {
     app.plugin_slots.items.clear();
     app.plugin_slots.scanned = None;
     app.plugin_slots.inventory = None;
-    // The Plugins menu and the Model tab's Plugins group read the installed plugins again.
+    // The Plugins menu and the Plugins tab's Plugins group read the installed plugins again.
     app.plugin_menu.loaded = false;
 }
 
@@ -387,7 +390,7 @@ mod tests {
             entries: serde_json::from_value(json!([
                 {"name":"report","effect":"read","slots":[
                     {"kind":"menu","name":"Manufacturing"}, {"kind":"menu","name":"Plugins"},
-                    {"kind":"ribbon","name":"Manufacturing"}, {"kind":"ribbon","name":"Model"}, {"kind":"ribbon","name":"inspect"}
+                    {"kind":"ribbon","name":"Manufacturing"}, {"kind":"ribbon","name":"Model"}, {"kind":"ribbon","name":"Plugins"}, {"kind":"ribbon","name":"inspect"}
                 ]},
                 {"name":"measure","effect":"read","slots":[
                     {"kind":"menu","name":" file "}, {"kind":"menu","name":"FILE"}, {"kind":"menu","name":"hElP"}
@@ -396,11 +399,13 @@ mod tests {
             .unwrap(),
         };
         let items = declared(&plugin);
-        assert_eq!(items.len(), 3, "unmapped menus and the Model tab are omitted and repeated placements are deduplicated");
+        assert_eq!(items.len(), 3, "unmapped menus and the Model and Plugins tabs are omitted and repeated placements are deduplicated");
         assert_eq!(items[0].slot, Slot::Ribbon("INSPECT"));
         assert_eq!(items[1].slot, Slot::Menu("File"));
         assert_eq!(items[2].slot, Slot::Menu("Help"));
         assert_eq!(menu_name("Manufacturing"), None);
+        assert_eq!(ribbon_name("Model"), None);
+        assert_eq!(ribbon_name("Plugins"), None);
     }
 
     #[test]
