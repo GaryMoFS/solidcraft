@@ -1676,69 +1676,32 @@ fn the_menu_lists_install_then_entries_with_a_submenu_for_several() {
     assert_eq!(labels, ["measure…", "tidy…"]);
 }
 
-/// Each plugin gets its own menu row or submenu, and one button on the Plugins tab (with a split
-/// dropdown when it has several commands), and a plugin turned off in Preferences shows in neither.
+/// Each plugin is its own thing: every command gets its own menu row (several under the plugin's
+/// name) and its own ribbon button, and a plugin turned off in Preferences shows in neither.
 #[test]
 fn each_plugin_command_has_its_own_menu_row_and_ribbon_button_and_a_disabled_plugin_is_hidden() {
     use crate::app_bar::FileRow;
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
     app.plugin_menu.listed = vec![
-        listed("gears", vec![entry("spur", "edit", json!([{"kind":"menu","name":"Plugins"}]))]),
-        listed(
-            "tools",
-            vec![
-                entry("measure", "read", json!([])),
-                entry("tidy", "edit", json!([{"kind":"ribbon","name":"Tidy up"}])),
-            ],
-        ),
-        listed(
-            "helix",
-            vec![
-                entry("create-helix", "edit", json!([{"kind":"menu","name":"Create Helix..."},{"kind":"ribbon","name":"Helix"}])),
-                entry(
-                    "create-variable-helix",
-                    "edit",
-                    json!([{"kind":"menu","name":"Create Variable Helix..."},{"kind":"ribbon","name":"Variable Helix"}]),
-                ),
-            ],
-        ),
+        listed("gears", vec![entry("spur", "edit", json!([]))]),
+        listed("tools", vec![entry("measure", "read", json!([])), entry("tidy", "edit", json!([{"kind":"ribbon","name":"Tidy up"}]))]),
     ];
     let buttons = ribbon_buttons(&app);
     let ids: Vec<&str> = buttons.iter().map(|b| b.id.as_str()).collect();
-    assert_eq!(ids, ["plugin_entry:gears:spur", "plugin_entry:tools:measure", "plugin_entry:helix:create-helix"]);
+    assert_eq!(ids, ["plugin_entry:gears:spur", "plugin_entry:tools:measure", "plugin_entry:tools:tidy"]);
     let labels: Vec<&str> = buttons.iter().map(|b| b.label.as_str()).collect();
-    assert_eq!(labels, ["gears plugin", "tools plugin", "Helix"], "host menu slots do not rename the button; first ribbon label names split buttons");
-    assert_eq!(buttons[0].entries.len(), 1);
-    assert_eq!(
-        buttons[1].entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
-        ["plugin_entry:tools:measure", "plugin_entry:tools:tidy"]
-    );
-    assert_eq!(buttons[1].split_name, "tools plugin");
-    assert_eq!(
-        buttons[2].entries.iter().map(|e| (e.id.as_str(), e.label.as_str())).collect::<Vec<_>>(),
-        [
-            ("plugin_entry:helix:create-helix", "Create Helix..."),
-            ("plugin_entry:helix:create-variable-helix", "Create Variable Helix..."),
-        ]
-    );
+    assert_eq!(labels, ["gears plugin", "measure", "Tidy up"], "one command: the plugin's name; a ribbon slot names its button");
     assert!(buttons.iter().all(|b| b.icon == "prefs_plugins"), "no manifest icon yet: the generic plugin icon");
     assert!(app.plugin_menu.dialogs.is_empty(), "listing opens nothing");
 
     let menu = rows(&app);
     assert!(matches!(&menu[3], FileRow::Item(i) if i.id == "entry:0:0" && i.label == "gears plugin…"));
     assert!(matches!(&menu[4], FileRow::Sub { label, rows } if label == "tools plugin" && rows.len() == 2));
-    assert!(matches!(&menu[5], FileRow::Sub { label, rows } if label == "helix plugin" && rows.len() == 2));
 
-    // Ribbon clicks can open either primary or secondary entries by id.
+    // The ribbon button opens that one command's dialog, titled by it alone.
     assert!(choose_ribbon(&mut app, "plugin_entry:tools:tidy"));
     let dialog = app.plugin_menu.dialogs.pop().expect("its dialog");
     assert_eq!((dialog.plugin.id.as_str(), dialog.entry.as_str(), dialog.label.as_str()), ("tools", "tidy", "tidy"));
-    assert!(choose_ribbon(&mut app, "plugin_entry:helix:create-variable-helix"));
-    let dialog = app.plugin_menu.dialogs.pop().expect("its dialog");
-    assert_eq!(
-        (dialog.plugin.id.as_str(), dialog.entry.as_str(), dialog.label.as_str()),
-        ("helix", "create-variable-helix", "Create Variable Helix...")
-    );
     assert!(!choose_ribbon(&mut app, "sketch.line"), "a command's id is not a plugin's");
 
     // The ribbon group's label opens the same menu below it (a narrow ribbon trims buttons).
@@ -1752,17 +1715,15 @@ fn each_plugin_command_has_its_own_menu_row_and_ribbon_button_and_a_disabled_plu
 
     app.preferences.disabled_plugins.insert("gears".into());
     let ids: Vec<String> = ribbon_buttons(&app).into_iter().map(|b| b.id).collect();
-    assert_eq!(ids, ["plugin_entry:tools:measure", "plugin_entry:helix:create-helix"], "off: no ribbon button");
+    assert_eq!(ids, ["plugin_entry:tools:measure", "plugin_entry:tools:tidy"], "off: no ribbon button");
     let menu = rows(&app);
-    assert_eq!(menu.len(), 5, "off: no menu row");
+    assert_eq!(menu.len(), 4, "off: no menu row");
     assert!(matches!(&menu[3], FileRow::Sub { label, .. } if label == "tools plugin"));
-    assert!(matches!(&menu[4], FileRow::Sub { label, .. } if label == "helix plugin"));
     choose_ribbon(&mut app, "plugin_entry:gears:spur");
     choose(&mut app, "entry:0:0");
     assert!(app.plugin_menu.dialogs.is_empty(), "a plugin turned off opens nothing");
 
     app.preferences.disabled_plugins.insert("tools".into());
-    app.preferences.disabled_plugins.insert("helix".into());
     assert!(ribbon_buttons(&app).is_empty());
     assert!(matches!(&rows(&app)[3], FileRow::Item(i) if i.label == app.tr("ui.plugin_menu_all_off") && !i.enabled));
 }
@@ -2197,10 +2158,159 @@ mod native {
         root
     }
 
+    #[test]
+    fn panel_row_click_runs_on_the_command_worker_and_refreshes_its_data() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        let folder = h.dir.join("sample");
+        std::fs::create_dir_all(&folder).unwrap();
+        let manifest = json!({"id":"sample","name":"Sample","version":"1","capabilities":["commands@0.2","ui@0.1"],"runtime":{
+            "module":"plugin.wasm","commands":["inspect.measure"],"entries":[{"name":"make","effect":"read","input_schema":{
+                "type":"object","properties":{"panel":{"type":"string"},"event":{"type":"string"},"path":{"type":"string"},"row":{"type":["string","null"]},"value":{"type":["object","string","null"]}}
+            }}],"limits":{"fuel":1000000,"memory_mib":2,"deadline_ms":5000},
+            "ui":{"ui_version":1,"panels":[{"id":"jobs","title":"Jobs","zones":["bottom"],"layout":{"root":0,"nodes":[{"widget":{"table":{
+                "bind":"/jobs","row_id":"id","columns":[{"key":"state","label":"state","unit":null}],"select":"single","on_select":"make","on_edit":"make"
+            }}}]}}],"workspaces":[]}
+        }});
+        let (package, version) = solidcraft_engine::plugin::API.split_once('@').unwrap();
+        let source = include_str!("../../craft-plugin-wasm/src/ui_fixture.wat")
+            .replace("__PACKAGE__", package)
+            .replace("__VERSION__", version)
+            .replace("__COMMAND__", "inspect.measure")
+            .replace("__COMMAND_LEN__", "15")
+            .replace("__ARGS__", "{}")
+            .replace("__ARGS_LEN__", "2");
+        std::fs::write(folder.join("plugin.json"), manifest.to_string()).unwrap();
+        std::fs::write(folder.join("plugin.wasm"), wat::parse_str(source).unwrap()).unwrap();
+        h.app.session.plugin_state.plugins_dir = Some(h.dir.clone());
+        let inspected = h.app.run("plugin.inspect", json!({"path":folder.to_string_lossy()})).unwrap();
+        let (initial, _) = h.call_queued("engine.execute", json!({"command":"sample.make","params":{"approval":inspected["approval"],"params":{}}}));
+        assert_eq!(initial["ok"], true, "{initial}");
+        h.frames(3);
+        assert_eq!(h.app.session.plugin_panels()[0].data.get("/jobs/0/state"), Some(&solidcraft_engine::plugin::ui::UiValue::Text("ready".into())));
+        let at = crate::scenario::rect_of("plugin-panel:sample:jobs:row:op1").expect("a real shared-host table row").center();
+        for pressed in [true, false] {
+            h.frame_with(crate::test_support::pointer(at, pressed));
+        }
+        settle(&mut h);
+        h.frames(2);
+        assert_eq!(
+            h.app.session.plugin_panels()[0].data.get("/jobs/0/state"),
+            Some(&solidcraft_engine::plugin::ui::UiValue::Text("posted".into())),
+            "clicks must reach the worker and adopt a later set-data"
+        );
+        assert!(h.app.session.doc.features.is_empty(), "read actions never edit the design");
+        // Keep the synthetic replacement below until the queued action has been inspected.
+        h.app.plugin_menu.loaded = true;
+        let pinned = h.app.session.plugin_panels()[0].clone();
+        crate::panel_runtime::queue_selection(
+            &h.app,
+            "sample".into(),
+            pinned.approval.clone(),
+            "make".into(),
+            solidcraft_engine::plugin::ui::UiEvent {
+                panel: "jobs".into(),
+                event: solidcraft_engine::plugin::ui::EventKind::Select,
+                path: "/jobs".into(),
+                row: Some("op1".into()),
+                value: None,
+            },
+        );
+        h.app.session.plugin_state.panels.get_mut("sample").unwrap().approval = "0".repeat(64);
+        h.frames(1);
+        assert!(h.app.plugin_menu.panel_runs.is_empty(), "a stale click never starts a worker under a replacement package's hash");
+        assert_eq!(h.app.session.plugin_panels()[0].data, pinned.data, "a discarded action leaves panel data alone");
+        h.app.session.plugin_state.panels.get_mut("sample").unwrap().approval = pinned.approval;
+
+        let id = h
+            .app
+            .universal_panel_frame()
+            .unwrap()
+            .layout
+            .sections
+            .iter()
+            .find(|section| section.instance.0.starts_with("plugin."))
+            .unwrap()
+            .instance
+            .clone();
+        h.app
+            .dispatch_panel_layout(solidcraft_engine::panels::LayoutAction::Apply {
+                expected_revision: None,
+                mutations: vec![solidcraft_engine::panels::Mutation::Close { instance: id.clone() }],
+            })
+            .unwrap();
+        h.frames(1);
+        assert!(h.app.session.plugin_panels()[0].visible, "a manual close is workspace placement, not guest state");
+        h.app.session.plugin_state.panels.get_mut("sample").unwrap().visibility_revision.insert("jobs".into(), 1);
+        h.frames(2);
+        assert!(
+            h.app.universal_panel_frame().unwrap().layout.sections.iter().any(|section| section.instance == id),
+            "a later show-panel(true) reopens the panel"
+        );
+        use solidcraft_engine::panels::{Destination, LayoutAction, Mutation, Point, SectionId, SectionLocation, Size};
+        let location = SectionLocation::Floating { origin: Point { x: 420.0, y: 180.0 } };
+        h.app
+            .dispatch_panel_layout(LayoutAction::Apply {
+                expected_revision: None,
+                mutations: vec![Mutation::Move {
+                    instance: id.clone(),
+                    destination: Destination::NewSection {
+                        section: SectionId::new("plugin-floating").unwrap(),
+                        index: 0,
+                        location: location.clone(),
+                        size: Size { width: 400.0, height: 240.0 },
+                    },
+                }],
+            })
+            .unwrap();
+        h.frames(2);
+        h.app.run_panel_command("layout.workspace.select", &json!({"workspace":"solidcraft.review"})).unwrap();
+        h.frames(2);
+        h.app.run_panel_command("layout.workspace.select", &json!({"workspace":"solidcraft.classic"})).unwrap();
+        h.frames(2);
+        assert_eq!(
+            h.app.panel_runtime().unwrap().layout().layout().containing(&id).unwrap().location,
+            location,
+            "placement is remembered per workspace"
+        );
+        {
+            let package = h.app.session.plugin_state.panels.get_mut("sample").unwrap();
+            package.visible.insert("jobs".into(), false);
+            package.visibility_revision.insert("jobs".into(), 2);
+        }
+        h.frames(2);
+        assert!(!h.app.universal_panel_frame().unwrap().layout.sections.iter().any(|section| section.instance == id));
+        h.app.run_panel_command("layout.workspace.select", &json!({"workspace":"solidcraft.review"})).unwrap();
+        h.frames(2);
+        assert!(
+            h.app.universal_panel_frame().unwrap().layout.sections.iter().any(|section| section.instance == id),
+            "a consumed hide request does not replay in another workspace"
+        );
+        h.app.run_panel_command("layout.workspace.select", &json!({"workspace":"solidcraft.classic"})).unwrap();
+        h.frames(2);
+        let saved = crate::panel_runtime::preferences_value(&h.app).unwrap();
+        let mut restarted = crate::scenario::Harness::new();
+        restarted.app.home.open = false;
+        restarted.app.disable_panel_runtime().unwrap();
+        restarted.app.session.plugin_state.plugins_dir = Some(h.dir.clone());
+        crate::panel_runtime::load_preferences(&mut restarted.app, &json!({"panel_layout":saved}));
+        restarted.frames(3);
+        let restored = restarted.app.panel_runtime().unwrap().layout().layout().instance(&id).unwrap();
+        assert!(!restored.requested_open, "an inert default declaration honours a restored closed instance");
+        assert_eq!(restored.memory.location, location, "inert plugin registration precedes saved layout restoration");
+        restarted.app.session.plugin_state.panels.get_mut("sample").unwrap().visibility_revision.insert("jobs".into(), 1);
+        restarted.frames(2);
+        assert_eq!(
+            restarted.app.panel_runtime().unwrap().layout().layout().containing(&id).unwrap().location,
+            location,
+            "a new explicit show request reopens a restored closed instance"
+        );
+    }
+
     fn settle(h: &mut crate::scenario::Harness) {
         for _ in 0..500 {
             h.frames(1);
-            if h.app.plugin_menu.dialog().is_none_or(|d| d.running.is_none()) {
+            if h.app.plugin_menu.dialog().is_none_or(|d| d.running.is_none()) && h.app.plugin_menu.panel_runs.is_empty() {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -2406,7 +2516,6 @@ mod native {
     fn the_plugins_menu_opens_from_the_ribbon_group_and_its_entry_opens_the_dialog() {
         let root = package("menu");
         let mut h = crate::scenario::Harness::new();
-        h.app.session.plugin_state.plugins_dir = Some(h.dir.join("plugins"));
         h.app.session.plugin_state.packages.insert("boxes".into(), root.join("boxes").to_string_lossy().into_owned());
         h.frames(2);
         // The ribbon's Plugins group label opens the menu below it.
@@ -2965,169 +3074,4 @@ mod native {
         assert!(same_camera(&h.app.cam, &stayed), "a failed run does not move the camera: {:?} vs {stayed:?}", h.app.cam);
         let _ = std::fs::remove_dir_all(root);
     }
-
-    #[test]
-    fn plugins_tab_replaces_model_buttons_and_groups_multi_entry_plugins_into_split_dropdowns() {
-        let root = std::env::temp_dir().join(format!("solidcraft-plugin-tab-{}", std::process::id()));
-        let (name, version) = solidcraft_engine::plugin::API.rsplit_once('@').unwrap();
-        let wasm = wat::parse_str(
-            &include_str!("plugin_menu_fixture.wat").replace("PLUGIN_PACKAGE", name).replace("PLUGIN_VERSION", version),
-        )
-        .unwrap();
-
-        let gears = root.join("gears");
-        std::fs::create_dir_all(&gears).unwrap();
-        std::fs::write(gears.join("plugin.wasm"), &wasm).unwrap();
-        std::fs::write(
-            gears.join("plugin.json"),
-            json!({
-                "id": "gears",
-                "name": "Gears",
-                "version": "0.1.0",
-                "capabilities": ["commands@0.1"],
-                "runtime": {
-                    "module": "plugin.wasm",
-                    "entries": [{"name": "make-gear", "effect": "edit", "slots": [{"kind": "menu", "name": "Plugins"}]}],
-                    "commands": ["solid.box"]
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let helix = root.join("helix");
-        std::fs::create_dir_all(&helix).unwrap();
-        std::fs::write(helix.join("plugin.wasm"), &wasm).unwrap();
-        std::fs::write(
-            helix.join("plugin.json"),
-            json!({
-                "id": "helix",
-                "name": "Helical Sketch Generator",
-                "version": "0.2.0",
-                "capabilities": ["commands@0.1"],
-                "runtime": {
-                    "module": "plugin.wasm",
-                    "entries": [
-                        {"name": "create-helix", "effect": "edit", "slots": [{"kind": "menu", "name": "Create Helix..."}, {"kind": "ribbon", "name": "Helix"}]},
-                        {"name": "create-variable-helix", "effect": "edit", "slots": [{"kind": "menu", "name": "Create Variable Helix..."}, {"kind": "ribbon", "name": "Variable Helix"}]}
-                    ],
-                    "commands": ["solid.box"]
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let mut h = crate::scenario::Harness::new();
-        h.app.home.open = false;
-        h.app.preferences.ribbon_tabs_only = false;
-        h.app.session.plugin_state.plugins_dir = Some(root.clone());
-        h.frames(2);
-
-        // Model tab has no plugin buttons.
-        assert_eq!(h.app.ui.tab, "MODEL");
-        assert!(crate::scenario::handle_at("button:plugin_entry:gears:make-gear").is_none());
-        assert!(crate::scenario::handle_at("button:plugin_entry:helix:create-helix").is_none());
-        assert!(crate::scenario::handle_at("tab:PLUGINS").is_some());
-
-        // Switching to the Plugins tab shows one button per plugin, and multi-entry plugins have a split dropdown.
-        h.step(&json!({"click": {"handle": "tab:PLUGINS"}})).unwrap();
-        h.frames(2);
-        assert_eq!(h.app.ui.tab, "PLUGINS");
-        assert!(crate::scenario::handle_at("button:plugin_entry:gears:make-gear").is_some());
-        assert!(crate::scenario::handle_at("button:plugin_entry:helix:create-helix").is_some());
-        assert!(crate::scenario::handle_at("button:plugin_entry:helix:create-variable-helix").is_none(), "grouped inside the split dropdown");
-        assert!(crate::scenario::handle_at("family:helix").is_some());
-        assert!(crate::scenario::handle_at("family:gears").is_none(), "single-entry plugin has no split dropdown");
-
-        h.step(&json!({"click": {"handle": "family:helix"}})).unwrap();
-        h.frames(2);
-        assert!(crate::scenario::handle_at("menu:plugin_entry:helix:create-helix").is_some());
-        assert!(crate::scenario::handle_at("menu:plugin_entry:helix:create-variable-helix").is_some());
-
-        h.step(&json!({"click": {"handle": "menu:plugin_entry:helix:create-variable-helix"}})).unwrap();
-        h.frames(2);
-        let dialog = h.app.plugin_menu.dialog().expect("split dropdown opens selected entry dialog");
-        assert_eq!(dialog.plugin.id, "helix");
-        assert_eq!(dialog.entry, "create-variable-helix");
-        assert_eq!(dialog.label, "Create Variable Helix...");
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-}
-
-#[test]
-fn x_solidcraft_order_orders_fields_and_rejects_non_string_list() {
-    let schema = json!({
-        "type": "object",
-        "required": ["edges"],
-        "x-solidcraft-order": ["edges", "path_mode", "profile", "offset_x"],
-        "properties": {
-            "offset_x": { "type": "number", "default": 0.0 },
-            "path_mode": { "type": "string", "oneOf": [{"const": "open", "title": "Open"}, {"const": "closed", "title": "Closed"}], "default": "open" },
-            "edges": { "type": "array", "minItems": 1, "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["edge"]} },
-            "profile": { "type": "array", "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["profile"]} },
-            "zeta": { "type": "string", "default": "" },
-            "alpha": { "type": "boolean", "default": true }
-        }
-    });
-    let fields = form(&schema).expect("valid schema with x-solidcraft-order");
-    let keys: Vec<&str> = fields.iter().map(|(f, _)| f.key.as_str()).collect();
-    assert_eq!(keys, ["edges", "path_mode", "profile", "offset_x", "alpha", "zeta"]);
-
-    let bad = json!({
-        "type": "object",
-        "x-solidcraft-order": ["edges", 42],
-        "properties": {
-            "edges": { "type": "array", "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["edge"]} }
-        }
-    });
-    assert_eq!(form(&bad), None);
-}
-
-#[test]
-fn edge_path_sweep_schema_parses_runs_with_edges_only_and_accepts_browser_sketch_pick() {
-    let mut h = box_and_pick_plugin();
-    let prof_sk = h.app.run("sketch.create", json!({"plane": "XY", "name": "ProfileSketch"})).unwrap();
-    let prof_id = prof_sk["sketch"].as_u64().unwrap();
-    h.app.run("sketch.rectangle.center", json!({"center": [0.0, 0.0], "corner": [2.0, 1.0]})).unwrap();
-    h.app.run("sketch.finish", json!({})).unwrap();
-    h.app.run("select.clear", json!({})).unwrap();
-
-    let mut unified = entry("edge-path-sweep", "edit", json!([{"kind": "menu", "name": "Edge Path & Sweep..."}, {"kind": "ribbon", "name": "Edge Path"}]));
-    unified.input_schema = json!({
-        "type": "object",
-        "required": ["edges"],
-        "x-solidcraft-order": ["edges", "path_mode", "profile", "profile_shape", "sweep_operation"],
-        "properties": {
-            "edges": { "type": "array", "title": "Edges", "minItems": 1, "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["edge"]} },
-            "path_mode": { "type": "string", "title": "Path Mode", "oneOf": [{"const": "open", "title": "Open"}, {"const": "closed", "title": "Closed Loop"}], "default": "open" },
-            "profile": { "type": "array", "title": "Sweep Profile (optional)", "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["profile"]} },
-            "profile_shape": { "type": "string", "title": "Built-in Profile", "oneOf": [{"const": "none", "title": "None"}, {"const": "circle", "title": "Circle"}], "default": "none" },
-            "sweep_operation": { "type": "string", "title": "Sweep Operation", "oneOf": [{"const": "new_body", "title": "New Body"}, {"const": "join", "title": "Join"}], "default": "new_body" }
-        }
-    });
-    h.app.plugin_menu.listed = vec![listed("edge-path-sweep", vec![unified])];
-    h.app.plugin_menu.loaded = true;
-
-    open_entry(&mut h.app, 0, 0);
-    h.frames(2);
-    let keys: Vec<&str> = h.app.plugin_menu.dialog().unwrap().fields.as_ref().unwrap().iter().map(|(f, _)| f.key.as_str()).collect();
-    assert_eq!(keys, ["edges", "path_mode", "profile", "profile_shape", "sweep_operation"]);
-
-    // Pick an edge in the viewport into `edges` (field 0). Path-only is ready immediately.
-    h.step(&json!({"click": {"world": [10, 0, 0]}})).unwrap();
-    h.frames(2);
-    let sent_path_only = h.app.plugin_menu.dialog().unwrap().ready(&h.app).expect("edges alone are sufficient for path-only");
-    assert_eq!(sent_path_only["edges"].as_array().map(Vec::len), Some(1));
-    assert!(sent_path_only.get("profile").is_none());
-
-    // Activate `profile` field (index 1) and click the sketch in the Browser (`pick_sketch_into_dialog`).
-    h.step(&json!({"click": {"handle": "plugin_dialog:field:profile"}})).unwrap();
-    h.frames(2);
-    assert_eq!(h.app.dialog.as_ref().map(|d| d.active), Some(1));
-    assert!(crate::browser::pick_sketch_into_dialog(&mut h.app, prof_id));
-    h.frames(2);
-    let sent_sweep = h.app.plugin_menu.dialog().unwrap().ready(&h.app).expect("edges + profile ready");
-    assert_eq!(sent_sweep["profile"], json!([{"type": "profile", "sketch": prof_id, "index": 0}]));
 }

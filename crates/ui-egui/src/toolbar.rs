@@ -1002,6 +1002,17 @@ pub(crate) fn start_export(app: &mut SolveApp, id: &str) -> bool {
     true
 }
 
+/// `file.export`'s `writer` for a file `name` (a path or a format): cadmpeg's for a STEP or IGES
+/// file while Preferences › General › Export STEP and IGES with cadmpeg is on; else left out, so
+/// SolidCraft's own writer writes it. The command never reads the preference itself.
+pub(crate) fn with_export_writer(app: &SolveApp, name: &str, params: &mut Value) {
+    let step_or_iges =
+        matches!(solidcraft_engine::io::Format::from_name(name), Ok(solidcraft_engine::io::Format::Step | solidcraft_engine::io::Format::Iges));
+    if app.preferences.cadmpeg_export && step_or_iges {
+        params["writer"] = json!("cadmpeg");
+    }
+}
+
 /// Export to a file with extension `ext`, in `format` when the extension alone doesn't name it.
 fn export_as(app: &mut SolveApp, ext: &str, format: Option<&str>) {
     let body = crate::export_name::first_body(app);
@@ -1013,16 +1024,39 @@ fn export_as(app: &mut SolveApp, ext: &str, format: Option<&str>) {
     app.pick_save(&name, exts, move |app, path| {
         let Some(path) = path else { return };
         let mut params = json!({"path": path});
-        if let Some(format) = format {
+        if let Some(format) = &format {
             params["format"] = json!(format);
         }
+        with_export_writer(app, format.as_deref().unwrap_or(&path), &mut params);
+        // GLB only, and not read for the other formats.
+        params["hierarchy"] = json!(app.preferences.glb_export_hierarchy);
         if let Ok(result) = app.run("file.export", params) {
-            let skipped =
-                result.get("skipped").and_then(Value::as_array).map_or(Vec::new(), |a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>());
-            let line = if skipped.is_empty() { format!("Exported {path}") } else { format!("Exported {path} (skipped {})", skipped.join(", ")) };
-            app.set_status(line, false);
+            exported(app, &path, &result);
         }
     });
+}
+
+/// The status line after an export: where the file went, with the bodies the exporter skipped and
+/// the first warning its writer gave. Each warning is kept in Messages, so what the file leaves out
+/// stays readable after the chip fades.
+pub(crate) fn exported(app: &mut SolveApp, path: &str, result: &Value) {
+    let listed = |key: &str| -> Vec<String> {
+        result.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
+    };
+    let warnings = listed("warnings");
+    for warning in &warnings {
+        let text = crate::i18n::tr_diagnostic(warning);
+        app.messages.push(&text, false, crate::now_ms());
+    }
+    let mut line = format!("Exported {path}");
+    if let Some(first) = warnings.first() {
+        line.push_str(&format!(" with {} warning(s): {first}", warnings.len()));
+    }
+    let skipped = listed("skipped");
+    if !skipped.is_empty() {
+        line.push_str(&format!(" (skipped {})", skipped.join(", ")));
+    }
+    app.set_status(line, false);
 }
 
 /// Commands opt into persistent presentation; the engine status list remains the only truth.
@@ -1510,8 +1544,7 @@ struct Panel {
     more: Vec<PanelMoreRow>,
 }
 
-/// The ribbon's Plugins group (Plugins tab): one button per plugin turned on (split dropdown when
-/// it has several entries).
+/// The ribbon's Plugins group (Model tab): one button per command of each plugin turned on.
 struct PluginGroup {
     label: String,
     tip: String,
@@ -1639,22 +1672,17 @@ impl RibbonPanels {
         // editing in place).
         let exit = (tab == "SKETCH" || (tab == "MODEL" && editing_in_place))
             && panels.last().is_some_and(|p| matches!(p.panel, "FINISH SKETCH" | "FINISH EDITING"));
-        let buttons = if tab == "PLUGINS" { crate::plugin_menu::ribbon_buttons(app) } else { Vec::new() };
-        let plugins = (tab == "PLUGINS" && !cfg!(target_arch = "wasm32")).then(|| PluginGroup {
+        let buttons = if tab == "MODEL" { crate::plugin_menu::ribbon_buttons(app) } else { Vec::new() };
+        let plugins = (!buttons.is_empty()).then(|| PluginGroup {
             label: app.tr("ui.plugins").to_string(),
-            tip: format!("{} ({})", app.tr("ui.plugins"), buttons.iter().map(|b| b.entries.len()).sum::<usize>()),
+            tip: format!("{} ({})", app.tr("ui.plugins"), buttons.len()),
             sizes: buttons
                 .iter()
                 .map(|b| {
                     if labels {
-                        let extra = if b.entries.len() > 1 { 6.0 } else { 0.0 };
-                        ButtonSize {
-                            width: (ribbon::button_width(painter, &b.label) + extra).min(ribbon::BUTTON_MAX_WIDTH),
-                            min_width: BUTTON_MIN_WIDTH,
-                        }
+                        ButtonSize { width: ribbon::button_width(painter, &b.label), min_width: BUTTON_MIN_WIDTH }
                     } else {
-                        let width = if b.entries.len() > 1 { 50.0 } else { 40.0 };
-                        ButtonSize { width, min_width: width }
+                        ButtonSize { width: 40.0, min_width: 40.0 }
                     }
                 })
                 .collect(),
@@ -1712,26 +1740,18 @@ impl RibbonPanels {
                         enabled: true,
                         pressed: false,
                         exit: false,
-                        split: (b.entries.len() > 1).then(|| ribbon::Split {
-                            key: &b.plugin_id,
-                            title: &b.label,
-                            name: &b.split_name,
-                        }),
+                        split: None,
                         app_paints: false,
                         covers: &[],
                     };
                     ribbon::Group {
-                        key: "PLUGINS:PLUGINS",
+                        key: "MODEL:PLUGINS",
                         name: &g.label,
                         label: &g.label,
                         tip: &g.tip,
                         buttons: g.buttons.iter().zip(&g.sizes).map(button).collect(),
                         cells: Vec::new(),
-                        commands: if g.buttons.is_empty() {
-                            vec!["plugins.menu"]
-                        } else {
-                            g.buttons.iter().flat_map(|b| b.entries.iter().map(|e| e.id.as_str())).collect()
-                        },
+                        commands: g.buttons.iter().map(|b| b.id.as_str()).collect(),
                         icon: Some("prefs_plugins"),
                         // Its label (and its collapsed button) opens the Plugins menu below it,
                         // which lists every command, the ones a narrow ribbon leaves out too.
@@ -1741,15 +1761,14 @@ impl RibbonPanels {
                         more: g
                             .buttons
                             .iter()
-                            .flat_map(|b| &b.entries)
-                            .map(|e| ribbon::MoreRow {
-                                id: &e.id,
-                                label: &e.label,
-                                icon: &e.icon,
+                            .map(|b| ribbon::MoreRow {
+                                id: &b.id,
+                                label: &b.label,
+                                icon: &b.icon,
                                 shortcut: "",
                                 enabled: true,
                                 checked: None,
-                                hint: Some(&e.name),
+                                hint: Some(&b.name),
                             })
                             .collect(),
                     }
@@ -1914,7 +1933,7 @@ fn ribbon_contents(app: &mut SolveApp, ui: &mut egui::Ui, shape: RibbonShape) ->
         // Every panel with all its buttons (the user's pins have no cap); a toolbar too narrow
         // for them narrows the buttons, then trims panels into their drop-down and the » menu.
         let editing_in_place = app.edit_in_place.active.is_some();
-        let lists: Vec<_> = crate::toolbar_custom::panel_lists(&tab)
+        let lists: Vec<_> = crate::toolbar_custom::panel_lists_for(app, &tab)
             .into_iter()
             .filter(|(panel, _, _)| editing_in_place || !(tab == "MODEL" && *panel == "FINISH EDITING"))
             .map(|(panel, mut cmds, promote)| {
@@ -1950,7 +1969,7 @@ fn ribbon_contents(app: &mut SolveApp, ui: &mut egui::Ui, shape: RibbonShape) ->
             ribbon::text(ui, at, app.tr("ui.toolbar_tabs_hidden"), t.font_body, t.text_dim, false);
             crate::scenario::publish_handle("ribbon:tabs_hidden", at);
         }
-        if tab == "PLUGINS" {
+        if tab == "MODEL" {
             crate::plugin_menu::ensure_listed(app);
         }
         let panels = RibbonPanels::new(app, ui, &tab, &lists, &painter, running.clone());
@@ -1986,35 +2005,6 @@ fn ribbon_contents(app: &mut SolveApp, ui: &mut egui::Ui, shape: RibbonShape) ->
             let deferred = d.deferred.take();
             if let Some(b) = panels.plugin_button(d) {
                 let _ = d.response.clone().backing_on_hover_text(&b.name);
-                if let Some(arrow) = &d.split {
-                    let heading_w = ui
-                        .painter()
-                        .layout_no_wrap(b.split_name.to_uppercase(), FontId::proportional(t.font_small), t.text)
-                        .size()
-                        .x
-                        + 32.0;
-                    let width = ribbon::menu_width(
-                        ui,
-                        b.entries.iter().map(|e| (e.label.as_str(), "", e.icon.as_str(), false)),
-                    )
-                    .max(heading_w);
-                    let mut chosen: Option<String> = None;
-                    Container::new(ui.ctx(), Surface::Popup).menu(arrow).frame(ui_kit::Menu::frame()).show(|ui| {
-                        ui.set_width((width - t.space_6 * 2.0 - 2.0).max(160.0));
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui_kit::Menu::heading(ui, &b.split_name);
-                        for entry in &b.entries {
-                            let row = ui_kit::Item::action(&entry.id, &entry.label, &entry.icon);
-                            if ui_kit::menu::list_row(ui, &row).is_some() {
-                                chosen = Some(entry.id.clone());
-                                ui.close();
-                            }
-                        }
-                    });
-                    if let Some(id) = chosen {
-                        crate::plugin_menu::choose_ribbon(app, &id);
-                    }
-                }
                 continue;
             }
             let Some(b) = panels.panel_button(d) else {
@@ -3076,7 +3066,11 @@ fn shortcuts_focused(app: &mut SolveApp, ctx: &egui::Context) {
         if k != Key::Escape {
             app.last_escape = None;
         }
-        if shown && (crate::keymap::drag_zoom_key(app, k, mods) || crate::navigation::view_key(app, ctx, k, mods, repeat)) {
+        if shown
+            && (crate::keymap::drag_zoom_key(app, k, mods)
+                || crate::navigation::toggle_mode_key(app, ctx, k, mods, repeat)
+                || crate::navigation::view_key(app, ctx, k, mods, repeat))
+        {
             continue;
         }
         // Alt+1 to Alt+9 show the shown design's first to ninth view (Ctrl+1 to Ctrl+7 keep
@@ -3174,7 +3168,8 @@ fn shortcuts_focused(app: &mut SolveApp, ctx: &egui::Context) {
                 }
                 // End navigation before the underlying tool or dialog; sketch double-Escape
                 // handling starts with the next press.
-                if app.viewport.nav.take().is_some() {
+                if app.viewport.nav_toggle.take().is_some() | app.viewport.nav.take().is_some() {
+                    app.viewport.nav_toggle_at = None;
                     app.last_escape = None;
                     continue;
                 }
@@ -3543,6 +3538,28 @@ mod header_report_tests {
         crate::keymap::press(&mut h.app, "Alt+Shift+F8", false);
         assert_eq!(h.app.dialog.as_ref().and_then(|d| d.command()), Some("file.save_mesh"), "STL opens Save As Mesh");
         crate::dialogs::cancel(&mut h.app);
+    }
+
+    /// What an exporter leaves out is said on the status line, and each warning stays in Messages
+    /// once the chip has faded; an export with nothing left out still says just where it went.
+    #[test]
+    fn an_export_with_warnings_says_so_and_keeps_them_in_messages() {
+        let mut h = crate::scenario::Harness::new();
+        let result = json!({
+            "path": "part.3dm",
+            "warnings": ["Pin: written as its mesh, without its name or colour", "Loose: written as its mesh"],
+            "skipped": ["Hidden"]
+        });
+        exported(&mut h.app, "part.3dm", &result);
+        let (line, _, error) = h.app.status.clone().expect("a status line");
+        assert_eq!(line, "Exported part.3dm with 2 warning(s): Pin: written as its mesh, without its name or colour (skipped Hidden)");
+        assert!(!error, "a warning, not a failure");
+        let messages: Vec<String> = h.app.messages.iter().map(|m| m.text.clone()).collect();
+        assert!(messages.iter().any(|m| m.contains("Pin: written as its mesh")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("Loose: written as its mesh")), "{messages:?}");
+
+        exported(&mut h.app, "part.step", &json!({"path": "part.step"}));
+        assert_eq!(h.app.status.as_ref().map(|s| s.0.as_str()), Some("Exported part.step"));
     }
 
     /// New designs are saved as `.sc`. A design opened from a `.solidcraft` file is saved back to
@@ -5940,14 +5957,10 @@ mod app_bar_tests {
         assert_eq!(crate::plugin_slots::items(&h.app, crate::plugin_slots::Slot::Menu("Help"))[0].label, "Workshop helper · report");
         assert!(crate::plugin_slots::items(&h.app, crate::plugin_slots::Slot::Menu("Manufacturing")).is_empty());
         assert!(crate::plugin_slots::items(&h.app, crate::plugin_slots::Slot::Menu("Plugins")).is_empty());
-        let visible = crate::workspace::visible_tabs(&h.app);
-        let weldments = visible.iter().position(|t| *t == "WELDMENTS");
-        let plugins = visible.iter().position(|t| *t == "PLUGINS");
-        assert!(weldments.is_some() && plugins == weldments.map(|i| i + 1), "PLUGINS follows WELDMENTS: {visible:?}");
+        assert!(!crate::workspace::visible_tabs(&h.app).contains(&"PLUGINS"), "there is no separate Plugins tab");
         assert_eq!(crate::plugin_slots::ribbon_name("sHeEt MeTaL"), Some("SHEET METAL"));
         assert_eq!(crate::plugin_slots::ribbon_name("Sketch"), Some("SKETCH"));
-        assert_eq!(crate::plugin_slots::ribbon_name("Model"), None, "Model hosts no duplicate slot group");
-        assert_eq!(crate::plugin_slots::ribbon_name("Plugins"), None, "Plugins tab already lists every plugin");
+        assert_eq!(crate::plugin_slots::ribbon_name("Model"), None, "Model's Plugins group already lists every command");
         let mut inspect = false;
         crate::test_support::frame(&h.ctx, egui::RawInput::default(), |ui| {
             let groups = crate::plugin_slots::ribbon_groups(&h.app, ui, "INSPECT");
@@ -6959,6 +6972,48 @@ mod command_start_tab_tests {
 mod persistent_ribbon_tests {
     use super::*;
     use crate::scenario::{self, Harness};
+
+    #[test]
+    fn surface_toolbar_switches_layout_without_losing_custom_pins() {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.call("ui.resize", json!({"width":2400,"height":1000}));
+        h.app.ui.tab = "SURFACE".into();
+        h.frames(3);
+        let lists = crate::toolbar_custom::panel_lists_for(&h.app, "SURFACE");
+        assert_eq!(lists.iter().map(|(p, _, _)| *p).collect::<Vec<_>>(), ["SKETCH", "CREATE", "EDIT", "MESH"]);
+        let (_, mesh, count) = lists.iter().find(|(p, _, _)| *p == "MESH").unwrap();
+        assert_eq!(mesh.iter().map(|c| c.id).collect::<Vec<_>>(), ["mesh.reduce", "mesh.convert", "file.insert_mesh", "file.save_mesh"]);
+        assert_eq!(
+            crate::toolbar_custom::buttons(&h.app, "SURFACE", "MESH", mesh, *count).iter().map(|c| c.id).collect::<Vec<_>>(),
+            ["mesh.reduce", "mesh.convert"]
+        );
+        h.step(&json!({"click":{"handle":"panel:SURFACE:CREATE"}})).unwrap();
+        assert!(scenario::handle_at("dropdown:surface.thicken").is_some());
+        h.step(&json!({"click":{"handle":"panel:SURFACE:CREATE"}})).unwrap();
+        assert!(scenario::handle_at("button:mesh.reduce").is_some());
+        assert!(scenario::handle_at("button:mesh.convert").is_some());
+        crate::toolbar_custom::pin(&mut h.app, "SURFACE", "file.insert_mesh").unwrap();
+        h.app.preferences.legacy_surface_toolbar = true;
+        h.frames(3);
+        let lists = crate::toolbar_custom::panel_lists_for(&h.app, "SURFACE");
+        assert_eq!(lists.iter().map(|(p, _, _)| *p).collect::<Vec<_>>(), ["SKETCH", "CREATE", "EDIT", "CONVERT"]);
+        let (_, create, count) = lists.iter().find(|(p, _, _)| *p == "CREATE").unwrap();
+        assert!(!create.iter().any(|c| c.id == "surface.thicken"));
+        assert_eq!(*count, 4);
+        let (_, convert, count) = lists.iter().find(|(p, _, _)| *p == "CONVERT").unwrap();
+        assert_eq!(convert.iter().map(|c| c.id).collect::<Vec<_>>(), ["surface.thicken", "mesh.convert", "mesh.reduce"]);
+        assert_eq!(*count, 2);
+        assert!(scenario::handle_at("button:surface.thicken").is_some());
+        assert!(scenario::handle_at("button:mesh.convert").is_some());
+        assert!(scenario::handle_at("button:mesh.reduce").is_none());
+        assert!(scenario::handle_at("button:file.insert_mesh").is_none(), "Mesh customizations stay hidden in the legacy layout");
+        h.app.preferences.legacy_surface_toolbar = false;
+        h.frames(3);
+        assert!(scenario::handle_at("button:file.insert_mesh").is_some());
+        h.call("ui.prefs", json!({"language":"ja"}));
+        assert_eq!(ribbon_label(&h.app, "MESH"), "メッシュ");
+    }
 
     fn harness() -> Harness {
         let mut h = Harness::new();
