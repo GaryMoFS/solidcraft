@@ -200,6 +200,8 @@ pub(crate) const CATEGORIES: &[(&str, Accept)] = &[
     ("edge", crate::selection::EDGES),
     ("face", crate::selection::FACES),
     ("body", crate::selection::BODIES),
+    ("axis", crate::selection::AXES),
+    ("plane", crate::selection::PLANES),
     ("sketch_point", crate::selection::EXTERNAL_POINTS),
     ("sketch_curve", crate::selection::SKETCH_LINES),
 ];
@@ -257,7 +259,11 @@ pub(crate) fn form(schema: &Value) -> Option<Vec<(Field, Input)>> {
     if required.iter().any(|key| !properties.contains_key(*key)) {
         return None;
     }
-    let mut fields = properties.iter().map(|(key, property)| field(key, property, required.contains(&key.as_str()))).collect::<Option<Vec<_>>>()?;
+    let mut fields = properties
+        .iter()
+        .filter(|(key, _)| !key.starts_with('_'))
+        .map(|(key, property)| field(key, property, required.contains(&key.as_str())))
+        .collect::<Option<Vec<_>>>()?;
     // A JSON object has no order: honor x-solidcraft-order first, then the required fields in the
     // order `required` names them, then the rest by name.
     let order_rank = |key: &str| order.iter().position(|o| *o == key).unwrap_or(usize::MAX);
@@ -1055,6 +1061,10 @@ pub(crate) struct EntryDialog {
     pub(crate) picks_cleared: bool,
     /// The dialog's Preview box: the host draws what Run would change while the fields are filled.
     pub(crate) preview: bool,
+    /// Snapshot of parameters captured by the on-demand Update Preview button when Auto preview is off.
+    pub(crate) preview_snapshot: Option<Value>,
+    /// True when the entry schema declares an internal `_preview` boolean for fast preview geometry.
+    pub(crate) supports_fast_preview: bool,
     pub(crate) form_guard: Option<solidcraft_engine::schema::plugin::FormGuard>,
     pub(crate) changed: bool,
     /// A stale Apply finished revalidation; only then ask the person to Apply again.
@@ -1297,6 +1307,12 @@ pub(crate) fn open_entry(app: &mut SolveApp, p: usize, e: usize) {
         pending: None,
         note: false,
     });
+    let auto_preview = entry.input_schema.get("x-solidcraft-preview").and_then(Value::as_str) != Some("manual");
+    let supports_fast_preview = entry
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|p| p.contains_key("_preview"));
     app.plugin_menu.dialogs.push(EntryDialog {
         id,
         label: command_title(&plugin, entry),
@@ -1315,7 +1331,9 @@ pub(crate) fn open_entry(app: &mut SolveApp, p: usize, e: usize) {
         writes,
         picked_on: prefilled.then(|| app.session.doc.clone()),
         picks_cleared: false,
-        preview: true,
+        preview: auto_preview,
+        preview_snapshot: None,
+        supports_fast_preview,
         form_guard: None,
         changed: false,
         revalidated: false,
@@ -1899,10 +1917,14 @@ pub(crate) fn preview_commands(app: &SolveApp) -> Option<(u64, String, Vec<(Stri
         Some(id) => app.plugin_menu.dialogs.iter().find(|d| d.id == id),
         None => app.plugin_menu.dialogs.iter().rev().find(|d| d.session == app.session.uid),
     }?;
-    if dialog.read || dialog.job || dialog.opens.is_some() || !dialog.preview || dialog.running.is_some() {
+    if dialog.read || dialog.job || dialog.opens.is_some() || dialog.running.is_some() {
         return None;
     }
-    let params = dialog.ready(app).ok()?;
+    let params = if dialog.preview {
+        dialog.ready(app).ok()?
+    } else {
+        dialog.preview_snapshot.clone()?
+    };
     let run = json!({"path": dialog.plugin.path, "approval": dialog.plugin.approval, "entry": dialog.entry, "params": params});
     Some((dialog.id, dialog.plugin.id.clone(), vec![("plugin.run".to_owned(), run)]))
 }
@@ -1951,7 +1973,12 @@ pub(crate) fn run_dialog(app: &mut SolveApp, id: u64) -> Result<(), String> {
     if dialog.running.is_some() {
         return Ok(());
     }
-    let params = dialog.ready(app)?;
+    let mut params = dialog.ready(app)?;
+    if let Some(obj) = params.as_object_mut()
+        && obj.contains_key("fast_preview")
+    {
+        obj.insert("fast_preview".to_owned(), Value::Bool(false));
+    }
     // The picks are sent as they are now: picking stops while the entry runs.
     if picking(app) == Some(id)
         && let Some(d) = app.dialog.take()
@@ -2359,16 +2386,41 @@ fn body(
             refresh_conditions(fields);
         }
     }
-    // Preview: a command that edits the design, as the native tools have it.
+    // Preview: Auto preview checkbox + on-demand Update Preview button + busy status indicator.
     if !dialog.read && !dialog.job && dialog.opens.is_none() && dialog.fields.is_some() {
-        ui.add_enabled_ui(editable, |ui| ui_kit::checkbox(ui, app.tr_label("Preview"), &mut dialog.preview));
-        if dialog.preview
+        let ready_params = if editable { dialog.ready(app).ok() } else { None };
+        ui.horizontal(|ui| {
+            let was_auto = dialog.preview;
+            ui.add_enabled_ui(editable, |ui| ui_kit::checkbox(ui, "Auto preview", &mut dialog.preview));
+            if dialog.preview != was_auto {
+                dialog.preview_snapshot = None;
+            }
+            if !dialog.preview {
+                let can_snap = editable && ready_params.is_some();
+                if ui
+                    .add_enabled_ui(can_snap, |ui| ui_kit::button(ui, "Update Preview", ui_kit::Button::Normal))
+                    .inner
+                    .clicked()
+                {
+                    dialog.preview_snapshot = ready_params;
+                }
+                if dialog.preview_snapshot.is_some()
+                    && ui_kit::button(ui, "Clear", ui_kit::Button::Normal).clicked()
+                {
+                    dialog.preview_snapshot = None;
+                }
+            }
+        });
+        let preview_active = dialog.preview || dialog.preview_snapshot.is_some();
+        if preview_active
             && editable
-            && app.preview.error.is_some()
             && preview_commands(app).is_some_and(|(id, _, _)| id == dialog.id)
-            && let Some(error) = &app.preview.error
         {
-            ui_kit::status_line(ui, &solidcraft_ui_text::format("ui.plugin_dialog_preview_failed", &[("error", error)]), ui_kit::StatusTone::Dim);
+            if app.preview.busy {
+                ui_kit::status_line(ui, "Computing preview...", ui_kit::StatusTone::Dim);
+            } else if let Some(error) = &app.preview.error {
+                ui_kit::status_line(ui, &solidcraft_ui_text::format("ui.plugin_dialog_preview_failed", &[("error", error)]), ui_kit::StatusTone::Dim);
+            }
         }
     }
     if dialog.changed {

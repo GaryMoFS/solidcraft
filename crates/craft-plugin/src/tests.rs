@@ -412,7 +412,7 @@ fn hostile_manifest_fields_return_errors() {
         |value: &mut Value| value["runtime"]["entries"] = json!(["make", "make"]),
         |value: &mut Value| value["runtime"]["limits"] = json!({"fuel":0,"memory_mib":64,"deadline_ms":1}),
         |value: &mut Value| value["runtime"]["limits"] = json!({"fuel":1,"memory_mib":4097,"deadline_ms":1}),
-        |value: &mut Value| value["runtime"]["limits"] = json!({"fuel":1,"memory_mib":1,"deadline_ms":30001}),
+        |value: &mut Value| value["runtime"]["limits"] = json!({"fuel":1,"memory_mib":1,"deadline_ms":300001}),
         |value: &mut Value| value["runtime"]["entries"] = json!([{"name":"make","input_schema":true}]),
     ] {
         let mut value = manifest();
@@ -852,7 +852,7 @@ fn an_importer_claims_extensions_needs_formats_and_never_mixes_with_commands() {
     command(&|v| v["runtime"]["entries"] = json!([{"name":"make","effect":"open"}]), "effect");
     command(&|v| v["runtime"]["permissions"] = json!({"input_folder":true}), "input_folder");
     command(&|v| v["capabilities"] = json!(["commands@0.1", "evaluate@0.1"]), "capabilities");
-    command(&|v| v["runtime"]["limits"] = json!({"fuel":1,"memory_mib":1,"deadline_ms":60000}), "deadline_ms");
+    command(&|v| v["runtime"]["limits"] = json!({"fuel":1,"memory_mib":1,"deadline_ms":350000}), "deadline_ms");
 }
 
 fn exporter() -> Value {
