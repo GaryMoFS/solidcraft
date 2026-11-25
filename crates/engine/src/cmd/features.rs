@@ -378,6 +378,7 @@ pub static COMMANDS: &[CommandSpec] = &[
             "length?: expr (from the end the thread starts at); ",
             "up_to?: [x,y,z] (a point, such as on a shoulder face: the thread runs to its place along the axis) | plane name or {origin, normal} (to where the plane crosses the axis); ",
             "from?: [x,y,z] near the end of the face the thread starts at (default: the face's only free end, the one with no material past it; else the end the `face` point lies within a third of the face of; a pick in the middle of a face whose ends are alike is refused); ",
+            "tolerance_class?: 6H/6g|4H|5H|6H|7H|8H|4G|5G|6G|7G|8G|4h|6h|8h|4g|6g|8g|4f|6f|8f|4e|6e|8e (ISO 965 metric fit callout; default basic profile, 6H/6g general purpose); clearance?: length expression (positive diametral allowance for a modeled thread: reduces the external diameter or enlarges the internal bore by this amount; normally apply it to one mating part); relief?: true | {width?: expr, depth?: expr} (modelled threads: a relief groove (thread undercut) at the inner end, away from where the thread starts, in place of `ease_out`: a plain groove the thread runs out into, width along the axis (default 1.5 P, at least one pitch) and radial depth past the thread's root (default 0.1 P); against a shoulder or a blind hole's bottom it ends at the face's end; with `length`, it is included at the inner end of the thread's length; refused where the inner end is a free end); ",
             "modeled?: bool (default false); ",
             "continuous_flanks?: bool (default true; false keeps the historical half-turn faces and groove-before-chamfer construction). Cosmetic: the model is unchanged, model.threads lists it. Modeled: cuts the thread profile into the body: past a free end the groove runs out a pitch into the air (or through a chamfer); ",
             "at a shoulder, a head or a blind hole's bottom it stops with its section clear of it, never cutting into it; ",
@@ -5347,6 +5348,51 @@ fn thread(s: &mut Session, p: &Value) -> Result<Value> {
         Some(v) => Some(Position(vec3(v).ok_or_else(|| bad(cmd, "`from` must be a point [x, y, z] near the end the thread starts at"))?)),
     };
     let modeled = p.get("modeled").and_then(Value::as_bool).unwrap_or(false);
+    let tolerance_class = str_(p, "tolerance_class").map(str::to_string);
+    if let Some(class) = &tolerance_class {
+        const ISO_METRIC_CLASSES: &[&str] = &[
+            "6H/6g", "4H", "5H", "6H", "7H", "8H", "4G", "5G", "6G", "7G", "8G", "4h", "6h", "8h", "4g", "6g", "8g", "4f", "6f", "8f", "4e", "6e",
+            "8e",
+        ];
+        if form != ThreadForm::Metric || !ISO_METRIC_CLASSES.contains(&class.as_str()) {
+            return Err(bad(
+                cmd,
+                "`tolerance_class` must be a supported ISO metric class (4H, 5H, 6H, 7H, 8H, 4G, 5G, 6G, 7G, 8G, 4h, 6h, 8h, 4g, 6g, 8g, 4f, 6f, 8f, 4e, 6e, 8e or 6H/6g)",
+            ));
+        }
+    }
+    let clearance = expr(p, "clearance");
+    if let Some(e) = &clearance {
+        check_expr(s, e, Kind::Length, cmd, "clearance")?;
+        let value = s.doc.eval(e, Kind::Length).map_err(|e| bad(cmd, format!("`clearance`: {e}")))?;
+        if !(value >= 0.0 && value.is_finite()) {
+            return Err(bad(cmd, "`clearance` must be finite and non-negative"));
+        }
+        if value > 0.0 && !modeled {
+            return Err(bad(cmd, "`clearance` needs `modeled: true`"));
+        }
+    }
+    let relief = match p.get("relief") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(solidcraft_doc::ThreadRelief::default()),
+        Some(o @ Value::Object(_)) => {
+            let width = expr(o, "width");
+            let depth = expr(o, "depth");
+            for (e, name) in [(&width, "relief.width"), (&depth, "relief.depth")] {
+                if let Some(e) = e {
+                    check_expr(s, e, Kind::Length, cmd, name)?;
+                }
+            }
+            Some(solidcraft_doc::ThreadRelief { width, depth })
+        }
+        Some(_) => return Err(bad(cmd, "`relief` must be true or {width?, depth?}")),
+    };
+    if relief.is_some() && !modeled {
+        return Err(bad(cmd, "`relief` is cut only on a modelled thread (`modeled: true`)"));
+    }
+    if relief.is_some() && ease_out.is_some() {
+        return Err(bad(cmd, "a thread's inner end takes `relief` or `ease_out`, not both"));
+    }
     // The coarse metric range bounds only a metric thread with no designation given.
     if designation.is_none() && form == ThreadForm::Metric {
         let state = s.model.state();
@@ -5389,6 +5435,9 @@ fn thread(s: &mut Session, p: &Value) -> Result<Value> {
         chamfer_angle,
         chamfer_depth,
         steep_flank,
+        tolerance_class,
+        clearance,
+        relief,
         // Only a thread saved before holes were sized by nominal diameter, edited by `timeline.redefine`.
         old_auto_size: designation_is_none && bool_(p, "old_auto_size").unwrap_or(false),
         additional_faces: additional_faces.iter().copied().map(FacePick).collect(),
