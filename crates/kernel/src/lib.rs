@@ -550,6 +550,7 @@ pub use topo::cylinder_face_at;
 pub use topo::material_in_ring;
 pub use topo::merged_topology;
 pub use topo::seam_flags;
+pub use topo::sides_beside_cylinder;
 pub use topo::whole_edge;
 pub use tspline::tspline_sheet;
 pub use validation::CheckFailure;

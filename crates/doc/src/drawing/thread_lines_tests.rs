@@ -466,6 +466,7 @@ fn a_cosmetic_thread_is_drawn_from_its_record() {
         form,
         hand: ThreadHand::default(),
         starts: 1,
+        design_root: false,
     };
     let screw = Thread::of(&info(false, 4.0, ThreadForm::Metric)).unwrap();
     let minor = 4.0 - 5.0 * (1.25 * 3f64.sqrt() / 2.0) / 8.0;
