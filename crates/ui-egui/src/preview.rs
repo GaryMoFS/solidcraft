@@ -112,6 +112,7 @@ impl Colors {
 pub struct SketchPreview {
     pub sketch: std::sync::Arc<solidcraft_engine::doc::SolvedSketch>,
     pub curves: Vec<usize>,
+    pub wires: Vec<usize>,
     pub points: Vec<usize>,
 }
 
@@ -1529,6 +1530,8 @@ pub(crate) fn sketch_changes(
     let old_curves = old.into_iter().flat_map(|s| s.sketch.curves.iter().map(|c| (c.id.as_str(), c))).collect::<std::collections::HashMap<_, _>>();
     let old_points =
         old.into_iter().flat_map(|s| s.sketch.points.iter().map(|p| (p.id.as_str(), p.pos))).collect::<std::collections::HashMap<_, _>>();
+    let old_wires =
+        old.into_iter().flat_map(|s| s.sketch.wires.iter().map(|w| (w.id.as_str(), w.pts.as_slice()))).collect::<std::collections::HashMap<_, _>>();
     let indices = sketch
         .sketch
         .curves
@@ -1541,6 +1544,16 @@ pub(crate) fn sketch_changes(
             if unchanged { None } else { Some(index) }
         })
         .collect::<Vec<_>>();
+    let wires = sketch
+        .sketch
+        .wires
+        .iter()
+        .enumerate()
+        .filter_map(|(index, wire)| {
+            let unchanged = old_wires.get(wire.id.as_str()).is_some_and(|previous| *previous == wire.pts.as_slice());
+            if unchanged { None } else { Some(index) }
+        })
+        .collect::<Vec<_>>();
     let points = sketch
         .sketch
         .points
@@ -1548,7 +1561,11 @@ pub(crate) fn sketch_changes(
         .enumerate()
         .filter_map(|(i, p)| if old_points.get(p.id.as_str()) == Some(&p.pos) { None } else { Some(i) })
         .collect::<Vec<_>>();
-    if indices.is_empty() && points.is_empty() { None } else { Some(SketchPreview { sketch: sketch.clone(), curves: indices, points }) }
+    if indices.is_empty() && wires.is_empty() && points.is_empty() {
+        None
+    } else {
+        Some(SketchPreview { sketch: sketch.clone(), curves: indices, wires, points })
+    }
 }
 
 /// Which of the `nf` faces of `m` are new surface, i.e. not on the old mesh? Each is decided by
@@ -1700,7 +1717,8 @@ pub fn paint_sketches(app: &SolveApp, painter: &egui::Painter, proj: &crate::vie
     if !app.dialog.as_ref().is_some_and(|d| {
         matches!(d.kind, crate::dialogs::Kind::SketchModify(_) | crate::dialogs::Kind::InsertDrawing(_) | crate::dialogs::Kind::InsertAirfoil(_))
             && d.previews()
-    }) {
+    }) && crate::plugin_menu::preview_commands(app).is_none()
+    {
         return;
     }
     let mut budget = solidcraft_engine::render::SamplingBudget::new(32_768, 65_536);
@@ -1708,8 +1726,8 @@ pub fn paint_sketches(app: &SolveApp, painter: &egui::Painter, proj: &crate::vie
     crate::scenario::publish_count("sketch_preview_curves", curves as f64);
 }
 
-/// Draw what a change moves in a sketch, its curves and points, in the preview colour; returns
-/// how many curves it drew.
+/// Draw what a change moves in a sketch, its curves, 3D wires and points, in the preview colour;
+/// returns how many curves and wires it drew.
 pub(crate) fn paint_sketch(
     preview: &SketchPreview,
     painter: &egui::Painter,
@@ -1721,12 +1739,27 @@ pub(crate) fn paint_sketch(
     for index in &preview.curves {
         crate::tools::paint_curve(&sketch.sketch, *index, &sketch.plane, painter, proj, stroke, budget);
     }
+    for index in &preview.wires {
+        if let Some(wire) = sketch.sketch.wires.get(*index) {
+            if wire.pts.len() == 1 {
+                if let Some(point) = proj.to_screen(wire.pts[0]) {
+                    painter.circle_filled(point, 3.0, stroke.color);
+                }
+            } else {
+                for seg in wire.pts.windows(2) {
+                    if let (Some(a), Some(b)) = (proj.to_screen(seg[0]), proj.to_screen(seg[1])) {
+                        painter.line_segment([a, b], stroke);
+                    }
+                }
+            }
+        }
+    }
     for index in &preview.points {
         if let Some(point) = sketch.sketch.point(*index).and_then(|p| proj.to_screen(sketch.plane.to_world(p))) {
             painter.circle_filled(point, 3.0, stroke.color);
         }
     }
-    preview.curves.len()
+    preview.curves.len() + preview.wires.len()
 }
 
 #[cfg(test)]
@@ -2274,8 +2307,24 @@ mod tests {
         assert_eq!(built.sketches.len(), 1);
         for preview in &built.sketches {
             assert_eq!(preview.curves, vec![0, 1]);
+            assert!(preview.wires.is_empty());
             assert!(preview.points.is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sketch_preview_includes_3d_wires() -> Result<(), Box<dyn std::error::Error>> {
+        let mut s = Session::default();
+        s.execute("sketch.create", &json!({"plane":"XY"}))?;
+        s.execute("sketch.options", &json!({"sketch_3d":true}))?;
+        let before = s.model.state();
+        s.execute("sketch.line3d", &json!({"points":[[0,0,0],[10,0,5],[10,10,5]]}))?;
+        let after = s.model.state();
+        let built = build(&before, &after, colors());
+        assert_eq!(built.sketches.len(), 1);
+        assert_eq!(built.sketches[0].wires, vec![0, 1]);
+        assert!(built.sketches[0].curves.is_empty());
         Ok(())
     }
 

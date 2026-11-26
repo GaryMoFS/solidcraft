@@ -2024,23 +2024,29 @@ impl Dialog {
         if self.refuse_sketch(s, id) {
             return true;
         }
-        if self.active != 0
-            || !matches!(self.kind, Kind::Extrude { .. } | Kind::Revolve { .. } | Kind::Emboss { .. })
-            || !self.inputs.first().is_some_and(|i| i.accept & PROFILES != 0)
+        if !matches!(
+            self.kind,
+            Kind::Extrude { .. } | Kind::Revolve { .. } | Kind::Emboss { .. } | Kind::Sweep { .. } | Kind::PluginPick { .. }
+        ) || !self.inputs.get(self.active).is_some_and(|i| i.accept & PROFILES != 0)
             || !s.doc.feature(id).is_some_and(|f| matches!(f.kind, FeatureKind::Sketch { .. }))
         {
             return false;
         }
-        let profiles: Vec<Sel> = crate::open_meshing::session_world(s)
+        let mut profiles: Vec<Sel> = crate::open_meshing::session_world(s)
             .sketch(id)
             .map(|ss| drawn_profiles(ss).into_iter().map(|index| Sel::Profile { sketch: id, index }).collect())
             .unwrap_or_default();
-        let Some(input) = self.inputs.first_mut() else { return false };
+        let Some(input) = self.inputs.get_mut(self.active) else { return false };
         if profiles.is_empty() {
             return false;
         }
+        if !input.multi {
+            profiles.truncate(1);
+        }
         input.items = profiles;
-        self.profile_selection_changed = true;
+        if self.active == 0 && matches!(self.kind, Kind::Extrude { .. } | Kind::Revolve { .. } | Kind::Emboss { .. }) {
+            self.profile_selection_changed = true;
+        }
         self.focus = true;
         self.error = None;
         self.sync_thread(s);
