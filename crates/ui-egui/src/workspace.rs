@@ -291,7 +291,6 @@ pub const TAB_ACCENTS: TabTable = TabTable::new(&[
     tab_style("FORM", AccentRamp::Form, Some("form")),
     tab_style("SHEET METAL", AccentRamp::Sheet, None),
     tab_style("WELDMENTS", AccentRamp::Main, None),
-    tab_style("PLUGINS", AccentRamp::Main, None),
     tab_style("ASSEMBLE", AccentRamp::Main, None),
     tab_style("INSERT", AccentRamp::Main, None),
     tab_style("INSPECT", AccentRamp::Main, None),
@@ -430,6 +429,7 @@ pub fn groups(tab: &str, panel: &str) -> &'static [CommandGroup] {
                     "construct.point.center",
                     "construct.point.edge_plane",
                     "construct.point.along_path",
+                    "construct.point.average",
                 ],
             },
         ],
@@ -559,7 +559,7 @@ pub const SECTIONS: &[Section] = &[
         tab: "MODEL",
         panel: "SKETCH",
         promoted: 1,
-        ids: &["sketch.create", "sketch.edit", "sketch.line3d", "sketch.arc3d", "sketch.spline3d", "sketch.point3d"],
+        ids: &["sketch.create", "sketch.edit", "sketch.line3d", "sketch.arc3d", "sketch.spline3d", "sketch.spline3d.control_point", "sketch.point3d"],
     },
     Section { tab: "MODEL", panel: "CREATE", promoted: 3, ids: &["solid.extrude", "solid.revolve", "solid.hole"] },
     Section {
@@ -786,8 +786,8 @@ pub const SECTIONS: &[Section] = &[
     Section { tab: "SHEET METAL", panel: "CONFIGURE", promoted: 2, ids: CONFIGURE },
     // A frame starts from a sketch of its lines; its profile sizes are often parameters.
     Section { tab: "WELDMENTS", panel: "SKETCH", promoted: 1, ids: &["sketch.create"] },
-    Section { tab: "WELDMENTS", panel: "CREATE", promoted: 3, ids: &["frame.member", "frame.end_cap", "frame.plate"] },
-    Section { tab: "WELDMENTS", panel: "MODIFY", promoted: 1, ids: &["frame.rotate_member"] },
+    Section { tab: "WELDMENTS", panel: "CREATE", promoted: 4, ids: &["frame.member", "frame.end_cap", "frame.plate", "frame.gusset"] },
+    Section { tab: "WELDMENTS", panel: "MODIFY", promoted: 1, ids: &["frame.rotate_member", "frame.trim"] },
     Section { tab: "WELDMENTS", panel: "CONFIGURE", promoted: 2, ids: CONFIGURE },
 ];
 
@@ -907,6 +907,7 @@ pub const RIBBON_LABELS: &[(&str, &str)] = &[
     ("drawing.view.section.planned", "Section View"),
     ("document.units", "Units"),
     ("frame.rotate_member", "Rotate"),
+    ("frame.trim", "Trim"),
     ("inspect.accessibility", "Access"),
     ("inspect.center_of_mass", "Mass Center"),
     ("inspect.curvature_comb", "Curv. Comb"),
@@ -988,6 +989,7 @@ pub const PLACEMENTS: &[(&str, &str, &str, &str)] = &[
     ("SHEET METAL", "CREATE", "SHEET METAL", "CREATE"),
     ("SHEET METAL", "MODIFY", "SHEET METAL", "FLAT"),
     ("WELDMENTS", "CREATE", "WELDMENTS", "CREATE"),
+    ("WELDMENTS", "MODIFY", "WELDMENTS", "MODIFY"),
     ("PLASTIC", "CREATE", "MODEL", "CREATE"),
     ("PLASTIC", "SETUP", "MANAGE", "RULES"),
     ("MESH", "MODIFY", "INSERT", "FILES"),
@@ -1084,6 +1086,7 @@ pub fn feature_icon(k: &FeatureKind) -> Option<&'static str> {
         FeatureKind::SheetFold { .. } => "fold",
         FeatureKind::SheetPath { .. } => "path_flange",
         FeatureKind::SheetTab { .. } => "sheet_tab",
+        FeatureKind::SheetBead { .. } => "rib",
         FeatureKind::SheetUnfold { refold: false, .. } => "unfold",
         FeatureKind::SheetUnfold { .. } => "refold",
         FeatureKind::SheetConvert { .. } | FeatureKind::SheetSurfaceConvert { .. } | FeatureKind::SheetRecognize { .. } => "convert_sheet",
@@ -1127,8 +1130,11 @@ pub fn frame_body(app: &crate::SolveApp) -> Option<String> {
     let name = active_body(app, &state)?;
     let body = state.bodies.iter().find(|b| b.name == name)?;
     let made_by = app.session.doc.feature(body.feature)?;
-    matches!(made_by.kind, FeatureKind::FrameMember { .. } | FeatureKind::FrameEndCap { .. } | FeatureKind::FramePlate { .. })
-        .then(|| body.name.clone())
+    matches!(
+        made_by.kind,
+        FeatureKind::FrameMember { .. } | FeatureKind::FrameEndCap { .. } | FeatureKind::FramePlate { .. } | FeatureKind::FrameGusset { .. }
+    )
+    .then(|| body.name.clone())
 }
 
 /// The design tabs following the general-purpose tabs in the ribbon.
@@ -1137,11 +1143,8 @@ pub struct SpecialtyTab {
     pub icon: &'static str,
 }
 
-pub const SPECIALTY_TABS: &[SpecialtyTab] = &[
-    SpecialtyTab { tab: "SHEET METAL", icon: "sheet" },
-    SpecialtyTab { tab: "WELDMENTS", icon: "frame_member" },
-    SpecialtyTab { tab: "PLUGINS", icon: "prefs_plugins" },
-];
+pub const SPECIALTY_TABS: &[SpecialtyTab] =
+    &[SpecialtyTab { tab: "SHEET METAL", icon: "sheet" }, SpecialtyTab { tab: "WELDMENTS", icon: "frame_member" }];
 
 /// A tab's row in the toolbar menu: the icon of the command that leads the tab (Model › Create ›
 /// Extrude, Inspect › Measure, View › Views and so on).
@@ -1396,7 +1399,7 @@ mod tests {
         type Slots = fn(&Tokens) -> [egui::Color32; 3];
         let main: Slots = |t| [t.accent, t.selected_ink, t.accent_soft];
         let render: Slots = |t| [t.render_fill, t.render_ink, t.render_soft];
-        let tabs: [(&str, Slots, Option<&str>); 17] = [
+        let tabs: [(&str, Slots, Option<&str>); 16] = [
             ("MODEL", main, None),
             ("SKETCH", |t| [t.sketch_accent, t.sketch_ink, t.sketch_soft], Some("sketch")),
             ("SURFACE", |t| [t.surface_fill, t.surface_ink, t.surface_soft], Some("surface")),
@@ -1404,7 +1407,6 @@ mod tests {
             ("FORM", |t| [t.form_fill, t.form_tab_ink, t.form_soft], Some("form")),
             ("SHEET METAL", |t| [t.sheet_fill, t.sheet_ink, t.sheet_soft], None),
             ("WELDMENTS", main, None),
-            ("PLUGINS", main, None),
             ("ASSEMBLE", main, None),
             ("INSERT", main, None),
             ("INSPECT", main, None),
@@ -1752,8 +1754,8 @@ mod tests {
     fn contextual_tabs_follow_the_active_body_and_allow_other_tabs() {
         let mut h = crate::scenario::Harness::new();
         let mut fresh = TABS.to_vec();
-        fresh.extend(["SHEET METAL", "WELDMENTS", "PLUGINS"]);
-        assert_eq!(visible_tabs(&h.app), fresh, "SHEET METAL, WELDMENTS and PLUGINS are reachable before any sheet body or member exists");
+        fresh.extend(["SHEET METAL", "WELDMENTS"]);
+        assert_eq!(visible_tabs(&h.app), fresh, "SHEET METAL and WELDMENTS are reachable before any sheet body or member exists");
         h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
         assert_eq!(h.app.ui.tab, "SKETCH");
         h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[40,30]})).unwrap();
@@ -1798,14 +1800,14 @@ mod tests {
         let specs = solidcraft_engine::command_specs();
         assert_eq!(panels("WELDMENTS"), ["SKETCH", "CREATE", "MODIFY", "CONFIGURE"]);
         let (create, n) = layout("WELDMENTS", "CREATE", &specs).unwrap();
-        assert_eq!(create.iter().take(n).map(|c| c.id).collect::<Vec<_>>(), ["frame.member", "frame.end_cap", "frame.plate"]);
+        assert_eq!(create.iter().take(n).map(|c| c.id).collect::<Vec<_>>(), ["frame.member", "frame.end_cap", "frame.plate", "frame.gusset"]);
         assert!(!panel_ids("MODEL", &specs).contains(&"frame.member"), "Frame Member's home is Weldments");
 
         let mut h = crate::scenario::Harness::new();
         h.step(&json!({"click":{"handle":"tab:WELDMENTS"}})).unwrap();
         h.frames(2);
         assert_eq!(h.app.ui.tab, "WELDMENTS");
-        for id in ["sketch.create", "frame.member", "frame.end_cap", "frame.plate", "parameters.change"] {
+        for id in ["sketch.create", "frame.member", "frame.end_cap", "frame.plate", "frame.gusset", "parameters.change"] {
             assert!(crate::scenario::handle_at(&format!("button:{id}")).is_some(), "{id} is a button on the Weldments tab");
         }
         h.step(&json!({"click":{"handle":"button:frame.member"}})).unwrap();
@@ -1913,7 +1915,7 @@ mod tests {
         let rows: Vec<_> = crate::toolbar_custom::toolbar_items(&h.app).into_iter().filter(|i| i.id == "ui.toolbarTab").collect();
         assert_eq!(
             rows.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
-            ["Model", "Surface", "Assemble", "Insert", "Inspect", "Manage", "View", "Sheet Metal", "Weldments", "Plugins"]
+            ["Model", "Surface", "Assemble", "Insert", "Inspect", "Manage", "View", "Sheet Metal", "Weldments"]
         );
         assert!(rows.iter().all(|i| i.shortcut == "current"), "all existing tabs stay on by default");
         h.step(&json!({"click":{"handle":"ribbon:add_tab"}})).unwrap();
@@ -2072,9 +2074,9 @@ mod tests {
         assert!(h.app.params.is_some(), "the ordinary Parameters button opens the editor");
         assert!(h.app.dialog.is_none());
         assert!(h.widget("User Parameters").is_some());
-        assert!(h.widget("Model Parameters").is_some());
+        assert!(h.widget("Model Parameters").is_none(), "model groups are bands in the shared table");
         // Exercise the inline draft row through the public add prompt and Enter.
-        h.step(&json!({"click":{"handle":"dialog:table:user:add"}})).unwrap();
+        h.step(&json!({"click":{"handle":"dialog:table:parameters:add"}})).unwrap();
         let parameters = h.app.params.as_mut().unwrap();
         parameters.new_name = "width".into();
         parameters.new_expr = "25 mm".into();

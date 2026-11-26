@@ -151,6 +151,39 @@ fn preflight_omits_absent_optional_selections_but_keeps_explicit_empty_values() 
 }
 
 #[test]
+fn optional_stored_selections_can_be_explicitly_unset() {
+    for empty in [false, true] {
+        let mut h = box_and_pick_plugin();
+        let name = h.app.session.model.state().bodies.first().unwrap().name.clone();
+        let saved = if empty { json!([]) } else { json!([{"type":"body","name":name}]) };
+        let schema = &mut h.app.plugin_menu.listed[0].entries[0].input_schema;
+        schema["required"] = json!([]);
+        schema["properties"]["body"]["minItems"] = json!(1);
+        open_form(&mut h.app, "inserts", "seats", &json!({"depth":2,"body":saved})).unwrap();
+        checked_prefill(&h.app);
+        if !empty {
+            // A saved pick stays in the field, and is sent, until it is explicitly unset.
+            assert_eq!(h.app.plugin_menu.dialog().unwrap().ready(&h.app).unwrap()["body"], saved);
+        } else {
+            assert!(
+                h.app.plugin_menu.dialog().unwrap().field_errors(&h.app).contains_key("body"),
+                "a stored empty pick list stays present until explicitly unset"
+            );
+        }
+        h.frames(3);
+        h.step(&json!({"click":{"handle":"plugin_dialog:unset:body"}})).unwrap();
+        checked_prefill(&h.app);
+        let dialog = h.app.plugin_menu.dialog().unwrap();
+        assert!(dialog.ready(&h.app).unwrap().get("body").is_none(), "Unset omits the optional field despite minItems");
+        assert!(!dialog.fields.as_ref().unwrap().iter().find(|(field, _)| field.key == "body").unwrap().0.prefilled);
+        assert!(
+            h.app.dialog.as_ref().unwrap().inputs.iter().all(|input| input.items.is_empty()),
+            "the viewport picker cannot restore an unset value"
+        );
+    }
+}
+
+#[test]
 fn validation_worker_disconnect_retries_and_field_errors_stay_cached() {
     let mut h = box_and_pick_plugin();
     open_form(&mut h.app, "inserts", "seats", &json!({"depth":2})).unwrap();
@@ -176,7 +209,10 @@ fn validation_worker_disconnect_retries_and_field_errors_stay_cached() {
 fn deliver_form_reply(app: &mut SolveApp, value: Value) {
     let (request, reply) = solidcraft_control::ControlRequest::new("engine.execute", json!({}));
     request.reply.send(value).unwrap();
-    app.plugin_menu.dialogs.last_mut().unwrap().running = Some(Running { reply, ticket: request.ticket, received: None });
+    let source_guard =
+        solidcraft_engine::schema::plugin::FormGuard { document_id: app.session.document_id.clone(), revision: app.session.design_revision() };
+    app.plugin_menu.dialogs.last_mut().unwrap().running =
+        Some(Running { reply, ticket: request.ticket, received: None, source_guard: Some(source_guard) });
 }
 
 #[test]
@@ -221,6 +257,57 @@ fn completed_form_replies_wait_for_the_originating_session() {
         assert_eq!(dialog.session, session);
         if kind != "validation" {
             assert_eq!(dialog.fields.as_ref().unwrap().iter().find(|(field, _)| field.key == "depth").unwrap().1, Input::Number(7.0));
+        }
+    }
+}
+
+#[test]
+fn requested_forms_keep_the_dispatch_revision_across_edits_and_deferred_replies() {
+    for read in [false, true] {
+        for deferred in [false, true] {
+            let mut h = box_and_pick_plugin();
+            h.app.plugin_menu.listed[0].entries[0].input_schema["properties"]["edges"]["minItems"] = json!(0);
+            open_entry(&mut h.app, 0, 0);
+            h.app.plugin_menu.dialogs.last_mut().unwrap().read = read;
+            let queued_revision = h.app.session.design_revision();
+            run(&mut h.app).unwrap();
+            let request = h.app.control_held.pop_front().unwrap();
+            h.app.run("solid.box", json!({"length":1,"width":1,"height":1})).unwrap();
+            check_dispatch(&mut h.app, &request).unwrap();
+            let first_dispatch = h.app.plugin_menu.dialog().unwrap().running.as_ref().unwrap().source_guard.as_ref().unwrap().revision;
+            assert_ne!(first_dispatch, queued_revision, "the queue-time design is not the run's design");
+            // Held requests can pass dispatch checking again before their worker copies the session.
+            h.app.run("solid.box", json!({"length":2,"width":1,"height":1})).unwrap();
+            check_dispatch(&mut h.app, &request).unwrap();
+            let source_revision = h.app.session.design_revision();
+            assert_ne!(source_revision, first_dispatch);
+            assert_eq!(h.app.plugin_menu.dialog().unwrap().running.as_ref().unwrap().source_guard.as_ref().unwrap().revision, source_revision);
+            assert!(take_interactive_run(&mut h.app, request.serial));
+            h.app.run("solid.box", json!({"length":3,"width":1,"height":1})).unwrap();
+            assert_ne!(source_revision, h.app.session.design_revision());
+            let reply = json!({"ok":true,"result":{"result":{},"forms":[{"plugin":"inserts","entry":"seats","params":{"depth":7}}]}});
+            request.reply.send(reply).unwrap();
+            if deferred {
+                crate::documents::open_tab(&mut h.app, solidcraft_engine::Session::default()).unwrap();
+                poll(&mut h.app);
+                let running = h.app.plugin_menu.dialog().unwrap().running.as_ref().unwrap();
+                assert!(running.received.is_some(), "the completed reply waits for its original session");
+                assert_eq!(running.source_guard.as_ref().unwrap().revision, source_revision);
+                crate::documents::switch(&mut h.app, 0);
+            }
+            poll(&mut h.app);
+            checked_prefill(&h.app);
+            let dialog = h.app.plugin_menu.dialog().unwrap();
+            let guard = dialog.form_guard.as_ref().unwrap();
+            assert_eq!(guard.document_id, h.app.session.document_id);
+            assert_eq!(guard.revision, source_revision, "the requested values belong to the worker's design");
+            assert!(dialog.changed, "a requested form from an earlier revision immediately requires review");
+            assert!(!dialog.revalidated);
+            assert_eq!(dialog.ready(&h.app).unwrap()["depth"], 7.0, "values still valid on the current design remain usable");
+            // Apply forwards the old guard, so the engine revalidates before executing the entry.
+            run(&mut h.app).unwrap();
+            let apply = h.app.control_held.pop_front().unwrap();
+            assert_eq!(apply.params.pointer("/params/form_guard/revision"), Some(&json!(source_revision)));
         }
     }
 }
@@ -788,6 +875,109 @@ fn set_input(fields: &mut [(Field, Input)], key: &str, input: Input) {
     *value = input;
     field.edited = true;
     refresh_conditions(fields);
+}
+
+#[test]
+fn dialog_preserves_declared_property_order_when_visibility_changes() {
+    let command: solidcraft_engine::plugin::Entry = serde_json::from_str(
+        r#"{"name":"make","input_schema":{
+            "type":"object","x-solidcraft-field-order":"declared","required":["alpha","extra","zeta"],"properties":{
+            "zeta":{"type":"number","default":1},
+            "extra":{"type":"number","default":2,"x-solidcraft-visible-when":{"field":"mode","eq":true}},
+            "mode":{"type":"boolean","default":false},
+            "alpha":{"type":"number","default":3},
+            "another_extra":{"type":"number","default":4,"x-solidcraft-visible-when":{"field":"mode","eq":true}}
+        }}}"#,
+    )
+    .unwrap();
+    let command = serde_json::from_value(serde_json::to_value(command).unwrap()).unwrap();
+    let mut h = crate::scenario::Harness::new();
+    h.app.plugin_menu.listed = vec![listed("ordered", vec![command])];
+    h.app.plugin_menu.loaded = true;
+    h.app.home.open = false;
+    open_entry(&mut h.app, 0, 0);
+    h.app.plugin_menu.dialogs.last_mut().unwrap().preview = false;
+    let declared = ["zeta", "extra", "mode", "alpha", "another_extra"];
+    for show in [false, true, false, true] {
+        let fields = h.app.plugin_menu.dialogs.last_mut().unwrap().fields.as_mut().unwrap();
+        set_input(fields, "mode", Input::Boolean(show));
+        let keys: Vec<&str> = fields.iter().map(|(field, _)| field.key.as_str()).collect();
+        assert_eq!(keys, declared, "evaluation order never moves fields");
+        let sent = params(fields).unwrap();
+        for key in ["extra", "another_extra"] {
+            assert_eq!(sent.get(key).is_some(), show, "hidden fields are omitted from parameters");
+        }
+        h.frames(4);
+        let visible: &[&str] = if show { &declared } else { &["zeta", "mode", "alpha"] };
+        let positions: Vec<f32> =
+            visible.iter().map(|key| crate::scenario::handle_at(&format!("plugin_dialog:field:{key}")).expect("visible field").y).collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "fields are drawn in declared order: {visible:?} at {positions:?}");
+        for key in ["extra", "another_extra"] {
+            assert_eq!(crate::scenario::handle_at(&format!("plugin_dialog:field:{key}")).is_some(), show);
+        }
+    }
+}
+
+#[test]
+fn unrecorded_dialog_fields_keep_required_then_alphabetical_order() {
+    for order in [None, Some(vec!["zeta".to_owned(), "missing".to_owned()])] {
+        let mut command = entry("make", "edit", json!([]));
+        command.input_schema = json!({"type":"object","x-solidcraft-field-order":"declared","required":["z_required","a_required"],"properties":{
+            "zeta":{"type":"number","default":1},
+            "z_required":{"type":"number","default":2},
+            "alpha":{"type":"number","default":3},
+            "a_required":{"type":"number","default":4}
+        }});
+        if let Some(order) = &order {
+            command.input_property_order.insert(String::new(), order.clone());
+        }
+        let mut h = crate::scenario::Harness::new();
+        h.app.plugin_menu.listed = vec![listed("ordered", vec![command])];
+        h.app.plugin_menu.loaded = true;
+        open_entry(&mut h.app, 0, 0);
+        let fields = h.app.plugin_menu.dialog().unwrap().fields.as_ref().unwrap();
+        let keys: Vec<&str> = fields.iter().map(|(field, _)| field.key.as_str()).collect();
+        let expected = if order.is_some() { ["zeta", "z_required", "a_required", "alpha"] } else { ["z_required", "a_required", "alpha", "zeta"] };
+        assert_eq!(keys, expected, "unrecorded keys retain their existing order, and stale recorded keys are ignored");
+    }
+}
+
+#[test]
+fn dialog_field_order_and_initial_picks_require_explicit_opt_in() {
+    let command: solidcraft_engine::plugin::Entry = serde_json::from_str(
+        r#"{"name":"make","input_schema":{"type":"object","required":["a_pick","z_pick","b_required"],"properties":{
+            "zeta":{"type":"number","default":1},
+            "z_pick":{"type":"array","x-solidcraft-selection":{"version":1,"accept":["body"]}},
+            "a_pick":{"type":"array","x-solidcraft-selection":{"version":1,"accept":["body"]}},
+            "alpha":{"type":"number","default":2},
+            "b_required":{"type":"number","default":3}
+        }}}"#,
+    )
+    .unwrap();
+    for declared in [false, true] {
+        let mut command = command.clone();
+        assert_eq!(command.input_property_order[""], ["zeta", "z_pick", "a_pick", "alpha", "b_required"]);
+        if declared {
+            command.input_schema["x-solidcraft-field-order"] = json!("declared");
+        }
+        let mut h = crate::scenario::Harness::new();
+        let picked = Sel::Body { name: "Part".into() };
+        h.app.session.selection.push(picked.clone());
+        h.app.plugin_menu.listed = vec![listed("ordered", vec![command])];
+        h.app.plugin_menu.loaded = true;
+        open_entry(&mut h.app, 0, 0);
+        let fields = h.app.plugin_menu.dialog().unwrap().fields.as_ref().unwrap();
+        let keys: Vec<&str> = fields.iter().map(|(field, _)| field.key.as_str()).collect();
+        let expected =
+            if declared { ["zeta", "z_pick", "a_pick", "alpha", "b_required"] } else { ["a_pick", "z_pick", "b_required", "alpha", "zeta"] };
+        assert_eq!(keys, expected, "recording declaration order alone does not opt in");
+        let first = if declared { "z_pick" } else { "a_pick" };
+        for key in ["a_pick", "z_pick"] {
+            let input = &fields.iter().find(|(field, _)| field.key == key).unwrap().1;
+            let picks = if key == first { vec![picked.clone()] } else { Vec::new() };
+            assert_eq!(input, &Input::Selection(picks), "only the first selection field receives existing viewport picks");
+        }
+    }
 }
 
 #[test]
@@ -1634,6 +1824,13 @@ fn listed(id: &str, entries: Vec<solidcraft_engine::plugin::Entry>) -> Listed {
         entries,
         images: Default::default(),
         swatches: Default::default(),
+        shaders: Vec::new(),
+        tints: Vec::new(),
+        panels: Vec::new(),
+        shader_settings: Default::default(),
+        pictures: Vec::new(),
+        updates: None,
+        themes: Vec::new(),
     }
 }
 
@@ -1676,69 +1873,32 @@ fn the_menu_lists_install_then_entries_with_a_submenu_for_several() {
     assert_eq!(labels, ["measure…", "tidy…"]);
 }
 
-/// Each plugin gets its own menu row or submenu, and one button on the Plugins tab (with a split
-/// dropdown when it has several commands), and a plugin turned off in Preferences shows in neither.
+/// Each plugin is its own thing: every command gets its own menu row (several under the plugin's
+/// name) and its own ribbon button, and a plugin turned off in Preferences shows in neither.
 #[test]
 fn each_plugin_command_has_its_own_menu_row_and_ribbon_button_and_a_disabled_plugin_is_hidden() {
     use crate::app_bar::FileRow;
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
     app.plugin_menu.listed = vec![
-        listed("gears", vec![entry("spur", "edit", json!([{"kind":"menu","name":"Plugins"}]))]),
-        listed(
-            "tools",
-            vec![
-                entry("measure", "read", json!([])),
-                entry("tidy", "edit", json!([{"kind":"ribbon","name":"Tidy up"}])),
-            ],
-        ),
-        listed(
-            "helix",
-            vec![
-                entry("create-helix", "edit", json!([{"kind":"menu","name":"Create Helix..."},{"kind":"ribbon","name":"Helix"}])),
-                entry(
-                    "create-variable-helix",
-                    "edit",
-                    json!([{"kind":"menu","name":"Create Variable Helix..."},{"kind":"ribbon","name":"Variable Helix"}]),
-                ),
-            ],
-        ),
+        listed("gears", vec![entry("spur", "edit", json!([]))]),
+        listed("tools", vec![entry("measure", "read", json!([])), entry("tidy", "edit", json!([{"kind":"ribbon","name":"Tidy up"}]))]),
     ];
     let buttons = ribbon_buttons(&app);
     let ids: Vec<&str> = buttons.iter().map(|b| b.id.as_str()).collect();
-    assert_eq!(ids, ["plugin_entry:gears:spur", "plugin_entry:tools:measure", "plugin_entry:helix:create-helix"]);
+    assert_eq!(ids, ["plugin_entry:gears:spur", "plugin_entry:tools:measure", "plugin_entry:tools:tidy"]);
     let labels: Vec<&str> = buttons.iter().map(|b| b.label.as_str()).collect();
-    assert_eq!(labels, ["gears plugin", "tools plugin", "Helix"], "host menu slots do not rename the button; first ribbon label names split buttons");
-    assert_eq!(buttons[0].entries.len(), 1);
-    assert_eq!(
-        buttons[1].entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
-        ["plugin_entry:tools:measure", "plugin_entry:tools:tidy"]
-    );
-    assert_eq!(buttons[1].split_name, "tools plugin");
-    assert_eq!(
-        buttons[2].entries.iter().map(|e| (e.id.as_str(), e.label.as_str())).collect::<Vec<_>>(),
-        [
-            ("plugin_entry:helix:create-helix", "Create Helix..."),
-            ("plugin_entry:helix:create-variable-helix", "Create Variable Helix..."),
-        ]
-    );
+    assert_eq!(labels, ["gears plugin", "measure", "Tidy up"], "one command: the plugin's name; a ribbon slot names its button");
     assert!(buttons.iter().all(|b| b.icon == "prefs_plugins"), "no manifest icon yet: the generic plugin icon");
     assert!(app.plugin_menu.dialogs.is_empty(), "listing opens nothing");
 
     let menu = rows(&app);
     assert!(matches!(&menu[3], FileRow::Item(i) if i.id == "entry:0:0" && i.label == "gears plugin…"));
     assert!(matches!(&menu[4], FileRow::Sub { label, rows } if label == "tools plugin" && rows.len() == 2));
-    assert!(matches!(&menu[5], FileRow::Sub { label, rows } if label == "helix plugin" && rows.len() == 2));
 
-    // Ribbon clicks can open either primary or secondary entries by id.
+    // The ribbon button opens that one command's dialog, titled by it alone.
     assert!(choose_ribbon(&mut app, "plugin_entry:tools:tidy"));
     let dialog = app.plugin_menu.dialogs.pop().expect("its dialog");
     assert_eq!((dialog.plugin.id.as_str(), dialog.entry.as_str(), dialog.label.as_str()), ("tools", "tidy", "tidy"));
-    assert!(choose_ribbon(&mut app, "plugin_entry:helix:create-variable-helix"));
-    let dialog = app.plugin_menu.dialogs.pop().expect("its dialog");
-    assert_eq!(
-        (dialog.plugin.id.as_str(), dialog.entry.as_str(), dialog.label.as_str()),
-        ("helix", "create-variable-helix", "Create Variable Helix...")
-    );
     assert!(!choose_ribbon(&mut app, "sketch.line"), "a command's id is not a plugin's");
 
     // The ribbon group's label opens the same menu below it (a narrow ribbon trims buttons).
@@ -1752,17 +1912,15 @@ fn each_plugin_command_has_its_own_menu_row_and_ribbon_button_and_a_disabled_plu
 
     app.preferences.disabled_plugins.insert("gears".into());
     let ids: Vec<String> = ribbon_buttons(&app).into_iter().map(|b| b.id).collect();
-    assert_eq!(ids, ["plugin_entry:tools:measure", "plugin_entry:helix:create-helix"], "off: no ribbon button");
+    assert_eq!(ids, ["plugin_entry:tools:measure", "plugin_entry:tools:tidy"], "off: no ribbon button");
     let menu = rows(&app);
-    assert_eq!(menu.len(), 5, "off: no menu row");
+    assert_eq!(menu.len(), 4, "off: no menu row");
     assert!(matches!(&menu[3], FileRow::Sub { label, .. } if label == "tools plugin"));
-    assert!(matches!(&menu[4], FileRow::Sub { label, .. } if label == "helix plugin"));
     choose_ribbon(&mut app, "plugin_entry:gears:spur");
     choose(&mut app, "entry:0:0");
     assert!(app.plugin_menu.dialogs.is_empty(), "a plugin turned off opens nothing");
 
     app.preferences.disabled_plugins.insert("tools".into());
-    app.preferences.disabled_plugins.insert("helix".into());
     assert!(ribbon_buttons(&app).is_empty());
     assert!(matches!(&rows(&app)[3], FileRow::Item(i) if i.label == app.tr("ui.plugin_menu_all_off") && !i.enabled));
 }
@@ -2095,7 +2253,7 @@ fn a_directory_field_browses_a_folder_and_an_outside_folder_stays_ungranted() {
 
     let picked = outside.to_string_lossy().into_owned();
     let answer = picked.clone();
-    h.app.services.pick_folder = Some(Box::new(move || Box::pin(std::future::ready(Some(answer.clone())))));
+    h.app.services.pick_folder = Some(Box::new(move |_: &str| Box::pin(std::future::ready(Some(answer.clone())))));
     h.frames(2);
     assert_eq!(h.widgets(&browse).len(), 1, "only the directory field has Browse");
     let y = |label: &str| h.widgets(label)[0][1];
@@ -2197,12 +2355,9 @@ mod native {
         root
     }
 
-    #[test]
-    fn panel_row_click_runs_on_the_command_worker_and_refreshes_its_data() {
-        let mut h = crate::scenario::Harness::new();
-        h.app.home.open = false;
-        let folder = h.dir.join("sample");
-        std::fs::create_dir_all(&folder).unwrap();
+    /// Write the "sample" plugin, whose panel "jobs" lists rows that run its `make` entry, to `folder`.
+    fn write_panel_plugin(folder: &std::path::Path) {
+        std::fs::create_dir_all(folder).unwrap();
         let manifest = json!({"id":"sample","name":"Sample","version":"1","capabilities":["commands@0.2","ui@0.1"],"runtime":{
             "module":"plugin.wasm","commands":["inspect.measure"],"entries":[{"name":"make","effect":"read","input_schema":{
                 "type":"object","properties":{"panel":{"type":"string"},"event":{"type":"string"},"path":{"type":"string"},"row":{"type":["string","null"]},"value":{"type":["object","string","null"]}}
@@ -2221,6 +2376,29 @@ mod native {
             .replace("__ARGS_LEN__", "2");
         std::fs::write(folder.join("plugin.json"), manifest.to_string()).unwrap();
         std::fs::write(folder.join("plugin.wasm"), wat::parse_str(source).unwrap()).unwrap();
+    }
+
+    /// Another design comes to the front: it gets the installed plugins' panels at once. The Model
+    /// tab no longer reads the plugins, and so no longer syncs the panels, on every frame (#21594).
+    #[test]
+    fn a_design_that_comes_to_the_front_gets_the_plugin_panels() {
+        let mut h = crate::scenario::Harness::new();
+        write_panel_plugin(&h.dir.join("sample"));
+        h.app.session.plugin_state.plugins_dir = Some(h.dir.clone());
+        let mut other = solidcraft_engine::Session::default();
+        other.plugin_state.plugins_dir = Some(h.dir.clone());
+        assert!(other.plugin_panels().is_empty());
+        crate::documents::open_tab(&mut h.app, other).unwrap();
+        let panels: Vec<String> = h.app.session.plugin_panels().iter().map(|p| p.plugin.clone()).collect();
+        assert_eq!(panels, ["sample"]);
+    }
+
+    #[test]
+    fn panel_row_click_runs_on_the_command_worker_and_refreshes_its_data() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        let folder = h.dir.join("sample");
+        write_panel_plugin(&folder);
         h.app.session.plugin_state.plugins_dir = Some(h.dir.clone());
         let inspected = h.app.run("plugin.inspect", json!({"path":folder.to_string_lossy()})).unwrap();
         let (initial, _) = h.call_queued("engine.execute", json!({"command":"sample.make","params":{"approval":inspected["approval"],"params":{}}}));
@@ -2555,7 +2733,6 @@ mod native {
     fn the_plugins_menu_opens_from_the_ribbon_group_and_its_entry_opens_the_dialog() {
         let root = package("menu");
         let mut h = crate::scenario::Harness::new();
-        h.app.session.plugin_state.plugins_dir = Some(h.dir.join("plugins"));
         h.app.session.plugin_state.packages.insert("boxes".into(), root.join("boxes").to_string_lossy().into_owned());
         h.frames(2);
         // The ribbon's Plugins group label opens the menu below it.
@@ -3114,169 +3291,4 @@ mod native {
         assert!(same_camera(&h.app.cam, &stayed), "a failed run does not move the camera: {:?} vs {stayed:?}", h.app.cam);
         let _ = std::fs::remove_dir_all(root);
     }
-
-    #[test]
-    fn plugins_tab_replaces_model_buttons_and_groups_multi_entry_plugins_into_split_dropdowns() {
-        let root = std::env::temp_dir().join(format!("solidcraft-plugin-tab-{}", std::process::id()));
-        let (name, version) = solidcraft_engine::plugin::API.rsplit_once('@').unwrap();
-        let wasm = wat::parse_str(
-            &include_str!("plugin_menu_fixture.wat").replace("PLUGIN_PACKAGE", name).replace("PLUGIN_VERSION", version),
-        )
-        .unwrap();
-
-        let gears = root.join("gears");
-        std::fs::create_dir_all(&gears).unwrap();
-        std::fs::write(gears.join("plugin.wasm"), &wasm).unwrap();
-        std::fs::write(
-            gears.join("plugin.json"),
-            json!({
-                "id": "gears",
-                "name": "Gears",
-                "version": "0.1.0",
-                "capabilities": ["commands@0.1"],
-                "runtime": {
-                    "module": "plugin.wasm",
-                    "entries": [{"name": "make-gear", "effect": "edit", "slots": [{"kind": "menu", "name": "Plugins"}]}],
-                    "commands": ["solid.box"]
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let helix = root.join("helix");
-        std::fs::create_dir_all(&helix).unwrap();
-        std::fs::write(helix.join("plugin.wasm"), &wasm).unwrap();
-        std::fs::write(
-            helix.join("plugin.json"),
-            json!({
-                "id": "helix",
-                "name": "Helical Sketch Generator",
-                "version": "0.2.0",
-                "capabilities": ["commands@0.1"],
-                "runtime": {
-                    "module": "plugin.wasm",
-                    "entries": [
-                        {"name": "create-helix", "effect": "edit", "slots": [{"kind": "menu", "name": "Create Helix..."}, {"kind": "ribbon", "name": "Helix"}]},
-                        {"name": "create-variable-helix", "effect": "edit", "slots": [{"kind": "menu", "name": "Create Variable Helix..."}, {"kind": "ribbon", "name": "Variable Helix"}]}
-                    ],
-                    "commands": ["solid.box"]
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let mut h = crate::scenario::Harness::new();
-        h.app.home.open = false;
-        h.app.preferences.ribbon_tabs_only = false;
-        h.app.session.plugin_state.plugins_dir = Some(root.clone());
-        h.frames(2);
-
-        // Model tab has no plugin buttons.
-        assert_eq!(h.app.ui.tab, "MODEL");
-        assert!(crate::scenario::handle_at("button:plugin_entry:gears:make-gear").is_none());
-        assert!(crate::scenario::handle_at("button:plugin_entry:helix:create-helix").is_none());
-        assert!(crate::scenario::handle_at("tab:PLUGINS").is_some());
-
-        // Switching to the Plugins tab shows one button per plugin, and multi-entry plugins have a split dropdown.
-        h.step(&json!({"click": {"handle": "tab:PLUGINS"}})).unwrap();
-        h.frames(2);
-        assert_eq!(h.app.ui.tab, "PLUGINS");
-        assert!(crate::scenario::handle_at("button:plugin_entry:gears:make-gear").is_some());
-        assert!(crate::scenario::handle_at("button:plugin_entry:helix:create-helix").is_some());
-        assert!(crate::scenario::handle_at("button:plugin_entry:helix:create-variable-helix").is_none(), "grouped inside the split dropdown");
-        assert!(crate::scenario::handle_at("family:helix").is_some());
-        assert!(crate::scenario::handle_at("family:gears").is_none(), "single-entry plugin has no split dropdown");
-
-        h.step(&json!({"click": {"handle": "family:helix"}})).unwrap();
-        h.frames(2);
-        assert!(crate::scenario::handle_at("menu:plugin_entry:helix:create-helix").is_some());
-        assert!(crate::scenario::handle_at("menu:plugin_entry:helix:create-variable-helix").is_some());
-
-        h.step(&json!({"click": {"handle": "menu:plugin_entry:helix:create-variable-helix"}})).unwrap();
-        h.frames(2);
-        let dialog = h.app.plugin_menu.dialog().expect("split dropdown opens selected entry dialog");
-        assert_eq!(dialog.plugin.id, "helix");
-        assert_eq!(dialog.entry, "create-variable-helix");
-        assert_eq!(dialog.label, "Create Variable Helix...");
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-}
-
-#[test]
-fn x_solidcraft_order_orders_fields_and_rejects_non_string_list() {
-    let schema = json!({
-        "type": "object",
-        "required": ["edges"],
-        "x-solidcraft-order": ["edges", "path_mode", "profile", "offset_x"],
-        "properties": {
-            "offset_x": { "type": "number", "default": 0.0 },
-            "path_mode": { "type": "string", "oneOf": [{"const": "open", "title": "Open"}, {"const": "closed", "title": "Closed"}], "default": "open" },
-            "edges": { "type": "array", "minItems": 1, "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["edge"]} },
-            "profile": { "type": "array", "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["profile"]} },
-            "zeta": { "type": "string", "default": "" },
-            "alpha": { "type": "boolean", "default": true }
-        }
-    });
-    let fields = form(&schema).expect("valid schema with x-solidcraft-order");
-    let keys: Vec<&str> = fields.iter().map(|(f, _)| f.key.as_str()).collect();
-    assert_eq!(keys, ["edges", "path_mode", "profile", "offset_x", "alpha", "zeta"]);
-
-    let bad = json!({
-        "type": "object",
-        "x-solidcraft-order": ["edges", 42],
-        "properties": {
-            "edges": { "type": "array", "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["edge"]} }
-        }
-    });
-    assert_eq!(form(&bad), None);
-}
-
-#[test]
-fn edge_path_sweep_schema_parses_runs_with_edges_only_and_accepts_browser_sketch_pick() {
-    let mut h = box_and_pick_plugin();
-    let prof_sk = h.app.run("sketch.create", json!({"plane": "XY", "name": "ProfileSketch"})).unwrap();
-    let prof_id = prof_sk["sketch"].as_u64().unwrap();
-    h.app.run("sketch.rectangle.center", json!({"center": [0.0, 0.0], "corner": [2.0, 1.0]})).unwrap();
-    h.app.run("sketch.finish", json!({})).unwrap();
-    h.app.run("select.clear", json!({})).unwrap();
-
-    let mut unified = entry("edge-path-sweep", "edit", json!([{"kind": "menu", "name": "Edge Path & Sweep..."}, {"kind": "ribbon", "name": "Edge Path"}]));
-    unified.input_schema = json!({
-        "type": "object",
-        "required": ["edges"],
-        "x-solidcraft-order": ["edges", "path_mode", "profile", "profile_shape", "sweep_operation"],
-        "properties": {
-            "edges": { "type": "array", "title": "Edges", "minItems": 1, "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["edge"]} },
-            "path_mode": { "type": "string", "title": "Path Mode", "oneOf": [{"const": "open", "title": "Open"}, {"const": "closed", "title": "Closed Loop"}], "default": "open" },
-            "profile": { "type": "array", "title": "Sweep Profile (optional)", "items": {"type": "object"}, "x-solidcraft-selection": {"version": 1, "accept": ["profile"]} },
-            "profile_shape": { "type": "string", "title": "Built-in Profile", "oneOf": [{"const": "none", "title": "None"}, {"const": "circle", "title": "Circle"}], "default": "none" },
-            "sweep_operation": { "type": "string", "title": "Sweep Operation", "oneOf": [{"const": "new_body", "title": "New Body"}, {"const": "join", "title": "Join"}], "default": "new_body" }
-        }
-    });
-    h.app.plugin_menu.listed = vec![listed("edge-path-sweep", vec![unified])];
-    h.app.plugin_menu.loaded = true;
-
-    open_entry(&mut h.app, 0, 0);
-    h.frames(2);
-    let keys: Vec<&str> = h.app.plugin_menu.dialog().unwrap().fields.as_ref().unwrap().iter().map(|(f, _)| f.key.as_str()).collect();
-    assert_eq!(keys, ["edges", "path_mode", "profile", "profile_shape", "sweep_operation"]);
-
-    // Pick an edge in the viewport into `edges` (field 0). Path-only is ready immediately.
-    h.step(&json!({"click": {"world": [10, 0, 0]}})).unwrap();
-    h.frames(2);
-    let sent_path_only = h.app.plugin_menu.dialog().unwrap().ready(&h.app).expect("edges alone are sufficient for path-only");
-    assert_eq!(sent_path_only["edges"].as_array().map(Vec::len), Some(1));
-    assert!(sent_path_only.get("profile").is_none());
-
-    // Activate `profile` field (index 1) and click the sketch in the Browser (`pick_sketch_into_dialog`).
-    h.step(&json!({"click": {"handle": "plugin_dialog:field:profile"}})).unwrap();
-    h.frames(2);
-    assert_eq!(h.app.dialog.as_ref().map(|d| d.active), Some(1));
-    assert!(crate::browser::pick_sketch_into_dialog(&mut h.app, prof_id));
-    h.frames(2);
-    let sent_sweep = h.app.plugin_menu.dialog().unwrap().ready(&h.app).expect("edges + profile ready");
-    assert_eq!(sent_sweep["profile"], json!([{"type": "profile", "sketch": prof_id, "index": 0}]));
 }
