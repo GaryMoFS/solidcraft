@@ -1560,7 +1560,8 @@ struct Panel {
     more: Vec<PanelMoreRow>,
 }
 
-/// The ribbon's Plugins group (Model tab): one button per command of each plugin turned on.
+/// The ribbon's Plugins group (Plugins tab): one button per plugin turned on (split dropdown when
+/// it has several entries).
 struct PluginGroup {
     label: String,
     tip: String,
@@ -1689,17 +1690,22 @@ impl RibbonPanels {
         // editing in place).
         let exit = (tab == "SKETCH" || (tab == "MODEL" && editing_in_place))
             && panels.last().is_some_and(|p| matches!(p.panel, "FINISH SKETCH" | "FINISH EDITING"));
-        let buttons = if tab == "MODEL" { crate::plugin_menu::ribbon_buttons(app) } else { Vec::new() };
-        let plugins = (!buttons.is_empty()).then(|| PluginGroup {
+        let buttons = if tab == "PLUGINS" { crate::plugin_menu::ribbon_buttons(app) } else { Vec::new() };
+        let plugins = (tab == "PLUGINS" && !cfg!(target_arch = "wasm32")).then(|| PluginGroup {
             label: app.tr("ui.plugins").to_string(),
-            tip: format!("{} ({})", app.tr("ui.plugins"), buttons.len()),
+            tip: format!("{} ({})", app.tr("ui.plugins"), buttons.iter().map(|b| b.entries.len()).sum::<usize>()),
             sizes: buttons
                 .iter()
                 .map(|b| {
                     if labels {
-                        ButtonSize { width: ribbon::button_width(painter, &b.label), min_width: BUTTON_MIN_WIDTH }
+                        let extra = if b.entries.len() > 1 { 6.0 } else { 0.0 };
+                        ButtonSize {
+                            width: (ribbon::button_width(painter, &b.label) + extra).min(ribbon::BUTTON_MAX_WIDTH),
+                            min_width: BUTTON_MIN_WIDTH,
+                        }
                     } else {
-                        ButtonSize { width: 40.0, min_width: 40.0 }
+                        let width = if b.entries.len() > 1 { 50.0 } else { 40.0 };
+                        ButtonSize { width, min_width: width }
                     }
                 })
                 .collect(),
@@ -1757,18 +1763,26 @@ impl RibbonPanels {
                         enabled: true,
                         pressed: false,
                         exit: false,
-                        split: None,
+                        split: (b.entries.len() > 1).then(|| ribbon::Split {
+                            key: &b.plugin_id,
+                            title: &b.label,
+                            name: &b.split_name,
+                        }),
                         app_paints: false,
                         covers: &[],
                     };
                     ribbon::Group {
-                        key: "MODEL:PLUGINS",
+                        key: "PLUGINS:PLUGINS",
                         name: &g.label,
                         label: &g.label,
                         tip: &g.tip,
                         buttons: g.buttons.iter().zip(&g.sizes).map(button).collect(),
                         cells: Vec::new(),
-                        commands: g.buttons.iter().map(|b| b.id.as_str()).collect(),
+                        commands: if g.buttons.is_empty() {
+                            vec!["plugins.menu"]
+                        } else {
+                            g.buttons.iter().flat_map(|b| b.entries.iter().map(|e| e.id.as_str())).collect()
+                        },
                         icon: Some("prefs_plugins"),
                         // Its label (and its collapsed button) opens the Plugins menu below it,
                         // which lists every command, the ones a narrow ribbon leaves out too.
@@ -1778,14 +1792,15 @@ impl RibbonPanels {
                         more: g
                             .buttons
                             .iter()
-                            .map(|b| ribbon::MoreRow {
-                                id: &b.id,
-                                label: &b.label,
-                                icon: &b.icon,
+                            .flat_map(|b| &b.entries)
+                            .map(|e| ribbon::MoreRow {
+                                id: &e.id,
+                                label: &e.label,
+                                icon: &e.icon,
                                 shortcut: "",
                                 enabled: true,
                                 checked: None,
-                                hint: Some(&b.name),
+                                hint: Some(&e.name),
                             })
                             .collect(),
                     }
@@ -2022,6 +2037,35 @@ fn ribbon_contents(app: &mut SolveApp, ui: &mut egui::Ui, shape: RibbonShape) ->
             let deferred = d.deferred.take();
             if let Some(b) = panels.plugin_button(d) {
                 let _ = d.response.clone().backing_on_hover_text(&b.name);
+                if let Some(arrow) = &d.split {
+                    let heading_w = ui
+                        .painter()
+                        .layout_no_wrap(b.split_name.to_uppercase(), FontId::proportional(t.font_small), t.text)
+                        .size()
+                        .x
+                        + 32.0;
+                    let width = ribbon::menu_width(
+                        ui,
+                        b.entries.iter().map(|e| (e.label.as_str(), "", e.icon.as_str(), false)),
+                    )
+                    .max(heading_w);
+                    let mut chosen: Option<String> = None;
+                    Container::new(ui.ctx(), Surface::Popup).menu(arrow).frame(ui_kit::Menu::frame()).show(|ui| {
+                        ui.set_width((width - t.space_6 * 2.0 - 2.0).max(160.0));
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui_kit::Menu::heading(ui, &b.split_name);
+                        for entry in &b.entries {
+                            let row = ui_kit::Item::action(&entry.id, &entry.label, &entry.icon);
+                            if ui_kit::menu::list_row(ui, &row).is_some() {
+                                chosen = Some(entry.id.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+                    if let Some(id) = chosen {
+                        crate::plugin_menu::choose_ribbon(app, &id);
+                    }
+                }
                 continue;
             }
             let Some(b) = panels.panel_button(d) else {
@@ -6188,10 +6232,14 @@ mod app_bar_tests {
         assert_eq!(crate::plugin_slots::items(&h.app, crate::plugin_slots::Slot::Menu("Help"))[0].label, "Workshop helper · report");
         assert!(crate::plugin_slots::items(&h.app, crate::plugin_slots::Slot::Menu("Manufacturing")).is_empty());
         assert!(crate::plugin_slots::items(&h.app, crate::plugin_slots::Slot::Menu("Plugins")).is_empty());
-        assert!(!crate::workspace::visible_tabs(&h.app).contains(&"PLUGINS"), "there is no separate Plugins tab");
+        let visible = crate::workspace::visible_tabs(&h.app);
+        let weldments = visible.iter().position(|t| *t == "WELDMENTS");
+        let plugins = visible.iter().position(|t| *t == "PLUGINS");
+        assert!(weldments.is_some() && plugins == weldments.map(|i| i + 1), "PLUGINS follows WELDMENTS: {visible:?}");
         assert_eq!(crate::plugin_slots::ribbon_name("sHeEt MeTaL"), Some("SHEET METAL"));
         assert_eq!(crate::plugin_slots::ribbon_name("Sketch"), Some("SKETCH"));
-        assert_eq!(crate::plugin_slots::ribbon_name("Model"), None, "Model's Plugins group already lists every command");
+        assert_eq!(crate::plugin_slots::ribbon_name("Model"), None, "Model hosts no duplicate slot group");
+        assert_eq!(crate::plugin_slots::ribbon_name("Plugins"), None, "Plugins tab already lists every plugin");
         let mut inspect = false;
         crate::test_support::frame(&h.ctx, egui::RawInput::default(), |ui| {
             let groups = crate::plugin_slots::ribbon_groups(&h.app, ui, "INSPECT");
