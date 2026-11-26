@@ -131,6 +131,7 @@ pub(crate) struct Field {
     pub(crate) key: String,
     pub(crate) label: String,
     pub(crate) tip: Option<String>,
+    pub(crate) tab: Option<String>,
     pub(crate) required: bool,
     pub(crate) kind: Kind,
     /// A choice's pictures, one package image path (`x-solidcraft-icon`) per option in order;
@@ -309,6 +310,7 @@ fn field(key: &str, property: &Value, required: bool) -> Option<(Field, Input)> 
         "x-solidcraft-visible-when",
         "x-solidcraft-enabled-when",
         "x-solidcraft-defaults",
+        "x-solidcraft-tab",
     ];
     if p.keys().any(|k| !ANNOTATIONS.contains(&k.as_str()) && !allowed.contains(&k.as_str())) {
         return None;
@@ -320,7 +322,7 @@ fn field(key: &str, property: &Value, required: bool) -> Option<(Field, Input)> 
     let words = |k: &str| p.get(k).is_none_or(Value::is_string);
     if !(numeric("minimum") && numeric("maximum") && numeric("multipleOf") && exclusive("exclusiveMinimum") && exclusive("exclusiveMaximum"))
         || !(count("minLength") && count("maxLength"))
-        || !(words("title") && words("description") && words("unit") && words("x-unit") && words("units") && words("format"))
+        || !(words("title") && words("description") && words("unit") && words("x-unit") && words("units") && words("format") && words("x-solidcraft-tab"))
     {
         return None;
     }
@@ -399,6 +401,7 @@ fn field(key: &str, property: &Value, required: bool) -> Option<(Field, Input)> 
             key: key.to_owned(),
             label,
             tip: text("description"),
+            tab: text("x-solidcraft-tab"),
             required,
             kind,
             images,
@@ -437,6 +440,7 @@ fn selection_field(key: &str, p: &Map<String, Value>, required: bool) -> Option<
         SELECTION_KEY,
         "x-solidcraft-visible-when",
         "x-solidcraft-enabled-when",
+        "x-solidcraft-tab",
     ];
     if p.keys().any(|k| !KEYWORDS.contains(&k.as_str())) {
         return None;
@@ -468,13 +472,14 @@ fn selection_field(key: &str, p: &Map<String, Value>, required: bool) -> Option<
         None => Some(None),
         Some(v) => Some(Some(v.as_str()?.trim()).filter(|s| !s.is_empty()).map(str::to_owned)),
     };
-    let (title, tip) = (text("title")?, text("description")?);
+    let (title, tip, tab) = (text("title")?, text("description")?, text("x-solidcraft-tab")?);
     let kind = Kind::Selection { accept, min: min.unwrap_or(0), max, names };
     Some((
         Field {
             key: key.to_owned(),
             label: title.unwrap_or_else(|| key.to_owned()),
             tip,
+            tab,
             required,
             kind,
             images: Vec::new(),
@@ -1093,6 +1098,8 @@ pub(crate) struct EntryDialog {
     validation_gate: Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>>,
     /// Its first result has been shown: later previews leave the user's camera alone.
     preview_drawn: bool,
+    /// Selected tab index when any field declares `x-solidcraft-tab`.
+    pub(crate) active_tab: usize,
 }
 
 /// One bounded worker per dialog; generations invalidate replies before any field is touched.
@@ -1369,6 +1376,7 @@ pub(crate) fn open_entry(app: &mut SolveApp, p: usize, e: usize) {
         #[cfg(test)]
         validation_gate: None,
         preview_drawn: false,
+        active_tab: 0,
     });
     // The new dialog's first selection field takes the viewport's picks, unless another tool is
     // picking: that tool keeps them until a field here is clicked.
@@ -2395,11 +2403,38 @@ fn body(
             ui_kit::text(ui, app.tr("ui.plugin_dialog_no_inputs"), ui_kit::Text::Note("plugin_no_inputs"));
         }
         Some(fields) => {
+            let mut tabs: Vec<String> = Vec::new();
+            for (field, _) in fields.iter() {
+                if let Some(tab) = field.tab.as_ref()
+                    && !tabs.iter().any(|t| t == tab)
+                {
+                    tabs.push(tab.clone());
+                }
+            }
+            let active_tab_name = if !tabs.is_empty() {
+                if dialog.active_tab >= tabs.len() {
+                    dialog.active_tab = 0;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for (idx, tab_name) in tabs.iter().enumerate() {
+                        if ui.selectable_label(dialog.active_tab == idx, tab_name).clicked() {
+                            dialog.active_tab = idx;
+                        }
+                    }
+                });
+                ui.separator();
+                Some(tabs[dialog.active_tab].clone())
+            } else {
+                None
+            };
             ui.add_enabled_ui(editable, |ui| {
                 let mut picks = 0;
                 for (field, input) in fields.iter_mut() {
                     let pick_index = picks;
-                    if !field.visible {
+                    let on_other_tab = active_tab_name
+                        .as_deref()
+                        .is_some_and(|active| field.tab.as_deref().is_some_and(|t| t != active));
+                    if !field.visible || on_other_tab {
                         if matches!(input, Input::Selection(_)) {
                             picks += 1;
                         }
