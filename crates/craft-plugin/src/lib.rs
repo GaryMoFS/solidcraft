@@ -26,7 +26,7 @@ pub const MAX_IMPORT_DESIGN_BYTES: usize = 256 * 1024 * 1024;
 /// The largest file an exporter may return (RFC 0015 §4: 256 MiB output).
 pub const MAX_EXPORT_FILE_BYTES: usize = 256 * 1024 * 1024;
 /// A command entry finishes within 30 s; an importer converting a large assembly may take minutes.
-pub const MAX_COMMAND_DEADLINE_MS: u64 = 30_000;
+pub const MAX_COMMAND_DEADLINE_MS: u64 = 300_000;
 pub const MAX_IMPORTER_DEADLINE_MS: u64 = 600_000;
 /// A long job (an entry with `"job": true`) runs for at most ten minutes. The limit is fixed: a
 /// plugin that needs longer asks for it through its own limits, not an app-wide setting.
@@ -857,7 +857,7 @@ impl RuntimeManifest {
                 return Err(invalid("runtime.permissions.input_folder", "only an importer reads the folder of the file it imports"));
             }
             if self.limits.deadline_ms > MAX_COMMAND_DEADLINE_MS {
-                return Err(invalid("runtime.limits.deadline_ms", "must be 1..30000"));
+                return Err(invalid("runtime.limits.deadline_ms", "must be 1..300000"));
             }
         }
         Ok(())
